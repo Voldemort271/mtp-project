@@ -42,6 +42,31 @@ The fine-grained scripts are also runnable directly: `scripts/build_bugs.py`, `s
 
 ---
 
+## Reproducing from a fresh clone
+
+The source, deps, and lockfile are committed; the BugsInPy benchmark environment is not (it is large and regenerable). One command provisions everything — project deps, the BugsInPy framework clone, per-project test venvs (Python 3.11), all buggy/fixed checkouts — and is idempotent:
+
+```bash
+uv run python scripts/setup_benchmark.py          # provision the environment
+uv run python scripts/setup_benchmark.py --build  # ... and build the corpus afterwards
+```
+
+Notes:
+- Requires `git`, `uv`, and network access (the first run clones BugsInPy and each project's history; checkouts take ~1–2 hours).
+- `scripts/setup_benchmark.py` handles the per-project Python version and test deps (nose/mock for thefuck, attrs/typed-ast for black, etc.) and applies the thefuck conftest patch automatically via `build_bugs.py`.
+
+Then reproduce the results:
+
+```bash
+uv run python scripts/build_bugs.py --workers 8   # ~45 min, deterministic
+uv run python scripts/run_all.py                  # train + evaluate + baselines + timing
+uv run python scripts/evaluate_diffuse.py         # diffuse-coverage benchmark (no benchmark env needed)
+```
+
+If you only want the parts that need no benchmark setup (engine, synthetic demo, diffuse benchmark, most tests), skip the provisioning and run `demo.py`, `build_corpus.py`, and `evaluate_diffuse.py` directly. The `data/pairs.csv`-based scripts and the leave-one-bug-out tests require the provisioned benchmark and corpus build to have run.
+
+---
+
 ## Motivation: why predict mutation outcomes?
 
 Fault localization ranks source lines by how likely they contain the bug. Two families dominate:
@@ -157,31 +182,6 @@ ML-PMT (trained on BugsInPy)   0.0  0.112   9.2  0.923
 This demonstrates the complementarity: **SBFL wins when coverage is discriminative; the mutation signal (real, and predicted when trained on the same distribution) wins when coverage is diffuse.** It also shows the predicted model does not transfer across fault distributions without matching training data.
 
 Caveat on the diffuse numbers: the modules were engineered so that, in most cases, only the fault line has a mutant that flips a failing test — so a perfect score there is partly an artifact of the construction. This benchmark shows the *mechanism* (mutation finds faults coverage cannot), not that the predicted model generalizes to arbitrary diffuse code.
-
----
-
-## Reproducing from a fresh clone
-
-The source, deps, and lockfile are committed; the BugsInPy benchmark environment is not (it is large and regenerable). One command provisions everything — project deps, the BugsInPy framework clone, per-project test venvs (Python 3.11), all buggy/fixed checkouts — and is idempotent:
-
-```bash
-uv run python scripts/setup_benchmark.py          # provision the environment
-uv run python scripts/setup_benchmark.py --build  # ... and build the corpus afterwards
-```
-
-Notes:
-- Requires `git`, `uv`, and network access (the first run clones BugsInPy and each project's history; checkouts take ~1–2 hours).
-- `scripts/setup_benchmark.py` handles the per-project Python version and test deps (nose/mock for thefuck, attrs/typed-ast for black, etc.) and applies the thefuck conftest patch automatically via `build_bugs.py`.
-
-Then reproduce the results:
-
-```bash
-uv run python scripts/build_bugs.py --workers 8   # ~45 min, deterministic
-uv run python scripts/run_all.py                  # train + evaluate + baselines + timing
-uv run python scripts/evaluate_diffuse.py         # diffuse-coverage benchmark (no benchmark env needed)
-```
-
-If you only want the parts that need no benchmark setup (engine, synthetic demo, diffuse benchmark, most tests), skip the provisioning and run `demo.py`, `build_corpus.py`, and `evaluate_diffuse.py` directly. The `data/pairs.csv`-based scripts and the leave-one-bug-out tests require the provisioned benchmark and corpus build to have run.
 
 ---
 
