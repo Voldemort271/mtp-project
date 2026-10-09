@@ -33,14 +33,14 @@ def test_generate_mutants_covers_all_three_operator_types():
     mutants = generate_mutants(BASE_SOURCE)
     types = {mutant["mutation_type"] for mutant in mutants}
 
-    assert {"MOR", "TSM", "FCS"} <= types
-    assert {mutant["function"] for mutant in mutants} == {
+    assert {"MOR", "ARC", "FCS"} <= types
+    assert {
         "expected_return",
         "portfolio_variance",
         "normalize_weights",
         "markowitz_weights",
         "transpose_returns",
-    }
+    } <= {mutant["function"] for mutant in mutants}
 
 
 def test_swapped_variant_has_repair_mutant():
@@ -146,6 +146,83 @@ def test_extended_engine_finds_roor_and_cor_mutants():
     types = {m["mutation_type"] for m in mutants}
     assert "ROOR" in types
     assert "COR" in types
+    for mutant in mutants:
+        compile(mutant["source"], "<mutant>", "exec")
+
+
+def test_new_operators_scp_cdr_arc_and_float_lcr():
+    source = (
+        "def f(s, n, x, a, b):\n"
+        "    if \"already exists.\" in s and n > 2.5:\n"
+        "        return 1000.0\n"
+        "    while a < 5.0:\n"
+        "        a += 1\n"
+        "    return s.replace(\"old\", \"new\")\n"
+        "def g(p, q):\n"
+        "    return q - p\n"
+    )
+    mutants = generate_mutants(source)
+    types = {m["mutation_type"] for m in mutants}
+
+    assert "SCP" in types
+    assert "CDR" in types
+    assert "ARC" in types
+
+    float_deltas = {
+        m["detail"]
+        for m in mutants
+        if m["mutation_type"] == "LCR"
+        and str(m.get("operator", "")) == "1000.0"
+    }
+    assert any(float(d) != 999.0 for d in float_deltas)
+
+    scp_sources = {m["source"] for m in mutants if m["mutation_type"] == "SCP"}
+    assert any('"already exists."' not in s for s in scp_sources)
+
+    cdr_sources = {m["source"] for m in mutants if m["mutation_type"] == "CDR"}
+    assert any("if True" in s for s in cdr_sources)
+
+    arc_sources = {m["source"] for m in mutants if m["mutation_type"] == "ARC"}
+    assert any("q - p" in s and "p - q" not in s for s in arc_sources)
+
+    for mutant in mutants:
+        compile(mutant["source"], "<mutant>", "exec")
+
+
+def test_extended_engine_finds_rtr_uoi_and_math_mor_mutants():
+    source = (
+        "def f(x, n):\n"
+        "    total = 0\n"
+        "    for i in range(n):\n"
+        "        total += x[i] % 3\n"
+        "    if total > 5:\n"
+        "        return total - x\n"
+        "    return -x\n"
+    )
+    mutants = generate_mutants(source)
+
+    types = {m["mutation_type"] for m in mutants}
+    assert "RTR" in types
+    assert "UOI" in types
+    assert "MOR" in types
+    mor_operators = {m["operator"] for m in mutants if m["mutation_type"] == "MOR"}
+    assert mor_operators & {"%", "//", "**"}
+
+    uoi_insert = any(
+        m["mutation_type"] == "UOI" and m["operator"] == "insert"
+        for m in mutants
+    )
+    uoi_remove = any(
+        m["mutation_type"] == "UOI" and m["operator"] == "remove"
+        for m in mutants
+    )
+    assert uoi_insert and uoi_remove
+
+    rtr_sources = {m["source"] for m in mutants if m["mutation_type"] == "RTR"}
+    assert "return None" in rtr_sources or any(
+        "return None" in s for s in rtr_sources
+    )
+
     for mutant in mutants:
         compile(mutant["source"], "<mutant>", "exec")
 

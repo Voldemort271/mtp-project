@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import libcst as cst
+import numpy as np
 from libcst.metadata import MetadataWrapper
 
 from .mutators import (
@@ -12,6 +13,8 @@ from .mutators import (
     MOR_OPERATORS,
     ROOR_OPERATORS,
     COR_OPERATORS,
+    RTR_REPLACEMENTS,
+    UNARY_MUTATABLE,
     Candidate,
 )
 
@@ -49,6 +52,7 @@ def generate_mutants(
             c.index if c.index is not None else -1,
         ),
     )
+
     mutants: list[dict] = []
     seen_sources: set[str] = set()
     for candidate in candidates:
@@ -118,14 +122,16 @@ def _replacements(module: cst.Module, candidate: Candidate):
             func=cst.parse_expression(partner),
             args=node.args,
         )
-    elif candidate.mutation_type == "TSM":
-        positional = [arg for arg in node.args if arg.keyword is None]
-        if len(positional) == 2:
-            keyword_args = [arg for arg in node.args if arg.keyword is not None]
-            yield "swap", cst.Call(
-                func=node.func,
-                args=[positional[1], positional[0], *keyword_args],
-            )
+    elif candidate.mutation_type == "ARC":
+        positional = [
+            i for i, arg in enumerate(node.args)
+            if arg.keyword is None and arg.star == ""
+        ]
+        if len(positional) >= 2:
+            first, second = positional[0], positional[1]
+            args = list(node.args)
+            args[first], args[second] = args[second], args[first]
+            yield "swap", cst.Call(func=node.func, args=args)
     elif candidate.mutation_type == "LCR":
         yield from _literal_replacements(node, candidate.detail)
     elif candidate.mutation_type == "NOTR":
@@ -134,6 +140,11 @@ def _replacements(module: cst.Module, candidate: Candidate):
         ):
             yield "remove", node.expression
         yield "insert", cst.UnaryOperation(operator=cst.Not(), expression=node)
+    elif candidate.mutation_type == "CDR":
+        yield "True", cst.Name("True")
+        yield "False", cst.Name("False")
+    elif candidate.mutation_type == "SCP":
+        yield from _string_replacements(node)
     elif candidate.mutation_type == "AAR":
         args = [
             arg for i, arg in enumerate(node.args) if i != candidate.index
@@ -141,6 +152,48 @@ def _replacements(module: cst.Module, candidate: Candidate):
         yield f"remove#{candidate.index}", cst.Call(func=node.func, args=args)
     elif candidate.mutation_type == "INX":
         yield from _index_replacements(node, candidate)
+    elif candidate.mutation_type == "UOI":
+        if isinstance(node, cst.UnaryOperation) and isinstance(
+            node.operator, UNARY_MUTATABLE
+        ):
+            yield "remove", node.expression
+        else:
+            yield "-", cst.UnaryOperation(operator=cst.Minus(), expression=node)
+            yield "+", cst.UnaryOperation(operator=cst.Plus(), expression=node)
+    elif candidate.mutation_type == "RTR":
+        for detail, value in RTR_REPLACEMENTS:
+            yield detail, cst.Return(value=value)
+
+
+def _string_replacements(node: cst.SimpleString):
+    """Yield (detail, replacement) for string-literal mutants.
+
+    Covers the fault family "wrong string constant" (empty string, whitespace
+    collapse, prefix/suffix truncation, swapped quote style). Mutants whose
+    source is unchanged are dropped by the caller's dedup.
+    """
+    original = node.value
+    try:
+        value = node.evaluated_value
+    except Exception:
+        return
+    if value is None:
+        return
+    variants = {
+        "empty": "",
+    }
+    stripped = value.strip()
+    if stripped != value:
+        variants["strip"] = stripped
+    if len(value) > 1:
+        variants["drop_first"] = value[1:]
+        variants["drop_last"] = value[:-1]
+    if value != "" and value.isspace():
+        variants["single_space"] = " "
+    for detail, replacement in variants.items():
+        if replacement == value:
+            continue
+        yield detail, cst.SimpleString(repr(replacement))
 
 
 def _int_node(value: int) -> cst.BaseExpression:
@@ -182,6 +235,14 @@ def _literal_replacements(node, original: str):
         for delta in (-1.0, 1.0):
             new_value = value + delta
             yield repr(new_value), _float_node(new_value)
+        # Small magnitude-scaled deltas express off-by-threshold / boundary
+        # bugs (e.g. 1000.0 -> 999.95), which ±1.0 cannot reach.
+        scale = 10 ** int(np.log10(abs(value))) if value != 0 else 1.0
+        for fraction in (0.005, 0.0005):
+            delta = scale * fraction
+            for sign in (-1, 1):
+                new_value = value + sign * delta
+                yield repr(new_value), _float_node(new_value)
     elif isinstance(node, cst.Name):
         if node.value == "True":
             yield "False", cst.Name("False")

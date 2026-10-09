@@ -27,7 +27,7 @@ VARIANT_SPECS = [
     ("v_nw_sum_prod", "normalize_weights", "FCS", "np.prod"),
     ("v_nw_div_mul", "normalize_weights", "MOR", "*"),
     ("v_mw_at_mul", "markowitz_weights", "MOR", "*"),
-    ("v_tr_reshape_swap", "transpose_returns", "TSM", "swap"),
+    ("v_tr_reshape_swap", "transpose_returns", "ARC", "swap"),
 ]
 
 

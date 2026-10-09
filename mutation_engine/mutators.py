@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import libcst as cst
-from libcst.metadata import MetadataWrapper, PositionProvider
+from libcst.metadata import MetadataWrapper, ParentNodeProvider, PositionProvider
 
 MOR_OPERATORS = {
     "+": cst.Add,
@@ -13,6 +13,9 @@ MOR_OPERATORS = {
     "*": cst.Multiply,
     "/": cst.Divide,
     "@": cst.MatrixMultiply,
+    "%": cst.Modulo,
+    "//": cst.FloorDivide,
+    "**": cst.Power,
 }
 
 ROOR_OPERATORS = {
@@ -52,6 +55,17 @@ CALL_SWAPS = (
     ("np.linalg.pinv", "np.linalg.inv"),
 )
 
+UNARY_MUTATABLE = (cst.Minus, cst.Plus, cst.BitInvert)
+
+# RTR: replace ``return expr`` with a constant that changes the returned value.
+RTR_REPLACEMENTS = (
+    ("None", cst.Name("None")),
+    ("0", cst.Integer("0")),
+    ('""', cst.SimpleString('""')),
+    ("False", cst.Name("False")),
+    ("[]", cst.List(elements=[])),
+)
+
 
 @dataclass
 class Candidate:
@@ -70,7 +84,9 @@ class CandidateVisitor(cst.CSTVisitor):
         self.module = module
         self.wrapper = wrapper
         self._positions = wrapper.resolve(PositionProvider)
+        self._parents = wrapper.resolve(ParentNodeProvider)
         self._function_stack: list[str] = []
+        self._unary_depth: int = 0
         self.candidates: list[Candidate] = []
 
     def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:
@@ -84,6 +100,20 @@ class CandidateVisitor(cst.CSTVisitor):
         operator = self.module.code_for_node(node.operator).strip()
         if operator in MOR_OPERATORS:
             self._record(node, "MOR", operator, line=self._positions[node.operator].start.line)
+        return True
+
+    def visit_UnaryOperation(self, node: cst.UnaryOperation) -> bool:
+        if isinstance(node.operator, UNARY_MUTATABLE):
+            self._record(node, "UOI", "remove", line=self._positions[node].start.line)
+        self._unary_depth += 1
+        return True
+
+    def leave_UnaryOperation(self, node: cst.UnaryOperation) -> None:
+        self._unary_depth -= 1
+
+    def visit_Return(self, node: cst.Return) -> bool:
+        if node.value is not None:
+            self._record(node, "RTR", "return", line=self._positions[node].start.line)
         return True
 
     def visit_Comparison(self, node: cst.Comparison) -> bool:
@@ -116,39 +146,95 @@ class CandidateVisitor(cst.CSTVisitor):
         for old, new in CALL_SWAPS:
             if func == old:
                 self._record(node, "FCS", func)
-        if func.endswith(".reshape") and is_swapable_reshape(node):
-            self._record(node, "TSM", None)
-        positional = [i for i, arg in enumerate(node.args) if arg.keyword is None]
+        positional = [i for i, arg in enumerate(node.args) if arg.keyword is None and arg.star == ""]
+        if len(positional) >= 2:
+            self._record(node, "ARC", "argswap", index=positional[0])
         if len(positional) > 1:
             for index in positional:
                 self._record(node, "AAR", None, index=index)
+        if self._unary_depth == 0 and self._unary_insertable(node):
+            self._record(node, "UOI", "insert", line=self._positions[node].start.line)
         return True
 
     def visit_Integer(self, node: cst.Integer) -> bool:
         self._record(node, "LCR", node.value, line=self._positions[node].start.line)
+        if self._unary_depth == 0 and self._unary_insertable(node):
+            self._record(node, "UOI", "insert", line=self._positions[node].start.line)
         return True
 
     def visit_Float(self, node: cst.Float) -> bool:
         self._record(node, "LCR", node.value, line=self._positions[node].start.line)
+        if self._unary_depth == 0 and self._unary_insertable(node):
+            self._record(node, "UOI", "insert", line=self._positions[node].start.line)
         return True
 
     def visit_Name(self, node: cst.Name) -> bool:
         if node.value in ("True", "False"):
             self._record(node, "LCR", node.value, line=self._positions[node].start.line)
+        if self._unary_depth == 0 and self._unary_insertable(node):
+            self._record(node, "UOI", "insert", line=self._positions[node].start.line)
+        return True
+
+    def visit_Attribute(self, node: cst.Attribute) -> bool:
+        if self._unary_depth == 0 and self._unary_insertable(node):
+            self._record(node, "UOI", "insert", line=self._positions[node].start.line)
         return True
 
     def visit_If(self, node: cst.If) -> bool:
         self._record(node.test, "NOTR", "not", line=self._positions[node.test].start.line)
+        self._record(node.test, "CDR", "constant", line=self._positions[node.test].start.line)
         return True
 
     def visit_While(self, node: cst.While) -> bool:
         self._record(node.test, "NOTR", "not", line=self._positions[node.test].start.line)
+        self._record(node.test, "CDR", "constant", line=self._positions[node.test].start.line)
+        return True
+
+    def visit_IfExp(self, node: cst.IfExp) -> bool:
+        self._record(node.test, "CDR", "constant", line=self._positions[node.test].start.line)
+        return True
+
+    def visit_SimpleString(self, node: cst.SimpleString) -> bool:
+        self._record(node, "SCP", node.value, line=self._positions[node].start.line)
         return True
 
     def visit_Subscript(self, node: cst.Subscript) -> bool:
         index = perturbable_element_index(node.slice)
         if index is not None:
             self._record(node, "INX", None, index=index, line=self._positions[node].start.line)
+        if self._unary_depth == 0 and self._unary_insertable(node):
+            self._record(node, "UOI", "insert", line=self._positions[node].start.line)
+        return True
+
+    def _unary_insertable(self, node: cst.CSTNode) -> bool:
+        """True when wrapping ``node`` in a unary minus/plus keeps valid syntax.
+
+        Insertion is only valid in value/expression position inside a function
+        body: not at module scope (which can break import), not on function or
+        class names, parameters, imports, attribute selectors, assignment
+        targets, keyword-argument names, or module-level statement keywords.
+        """
+        if not self._function_stack:
+            return False
+        parent = self._parents.get(node)
+        if isinstance(parent, (cst.FunctionDef, cst.ClassDef, cst.Param, cst.Lambda)):
+            return False
+        if isinstance(parent, (cst.ImportAlias, cst.ImportFrom, cst.AsName)):
+            return False
+        # ``-a`` is not valid syntactically inside a dotted name; negation
+        # belongs on the whole attribute expression, not its parts.
+        if isinstance(parent, cst.Attribute):
+            return False
+        if isinstance(parent, (cst.Del, cst.Global, cst.Nonlocal, cst.Decorator)):
+            return False
+        if isinstance(parent, cst.Arg) and node is parent.keyword:
+            return False
+        if isinstance(parent, (cst.AssignTarget, cst.AnnAssign, cst.AugAssign)) and node is parent.target:
+            return False
+        if isinstance(parent, (cst.For, cst.CompFor)) and node is parent.target:
+            return False
+        if isinstance(parent, cst.With) and any(node is item.item for item in parent.items):
+            return False
         return True
 
     def _record(
@@ -173,23 +259,6 @@ class CandidateVisitor(cst.CSTVisitor):
                 index=index,
             )
         )
-
-
-def is_swapable_reshape(node: cst.Call) -> bool:
-    """True when a reshape call has two positional args and one is -1."""
-    positional = [arg for arg in node.args if arg.keyword is None]
-    if len(positional) != 2:
-        return False
-    return any(is_neg_one(arg.value) for arg in positional)
-
-
-def is_neg_one(value: cst.BaseExpression) -> bool:
-    return (
-        isinstance(value, cst.UnaryOperation)
-        and isinstance(value.operator, cst.Minus)
-        and isinstance(value.expression, cst.Integer)
-        and value.expression.value == "1"
-    )
 
 
 def perturbable_element_index(slice_elements) -> int | None:

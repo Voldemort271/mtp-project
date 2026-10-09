@@ -28,6 +28,8 @@ BUGS = [
     {"project": "tqdm", "bug": 2, "venv": "tqdm_1", "packages": ["tqdm"]},
     {"project": "tqdm", "bug": 4, "venv": "tqdm_1", "packages": ["tqdm"]},
     {"project": "tqdm", "bug": 5, "venv": "tqdm_1", "packages": ["tqdm"]},
+    {"project": "tqdm", "bug": 6, "venv": "tqdm_1", "packages": ["tqdm"]},
+    {"project": "tqdm", "bug": 8, "venv": "tqdm_1", "packages": ["tqdm"]},
     {"project": "tqdm", "bug": 9, "venv": "tqdm_1", "packages": ["tqdm"]},
     {"project": "thefuck", "bug": 1, "venv": "thefuck_5", "packages": ["thefuck"]},
     {"project": "thefuck", "bug": 2, "venv": "thefuck_5", "packages": ["thefuck"]},
@@ -39,13 +41,16 @@ BUGS = [
     {"project": "thefuck", "bug": 26, "venv": "thefuck_5", "packages": ["thefuck"]},
     {"project": "thefuck", "bug": 27, "venv": "thefuck_5", "packages": ["thefuck"]},
     {"project": "thefuck", "bug": 28, "venv": "thefuck_5", "packages": ["thefuck"]},
+    {"project": "thefuck", "bug": 29, "venv": "thefuck_5", "packages": ["thefuck"]},
     {"project": "thefuck", "bug": 30, "venv": "thefuck_5", "packages": ["thefuck"]},
+    {"project": "thefuck", "bug": 31, "venv": "thefuck_5", "packages": ["thefuck"]},
     {"project": "thefuck", "bug": 32, "venv": "thefuck_5", "packages": ["thefuck"]},
     {"project": "black", "bug": 4, "venv": "black_4", "packages": ["black", "blib2to3"]},
     {"project": "black", "bug": 5, "venv": "black_4", "packages": ["black", "blib2to3"]},
     {"project": "black", "bug": 6, "venv": "black_4", "packages": ["black", "blib2to3"]},
     {"project": "black", "bug": 7, "venv": "black_4", "packages": ["black", "blib2to3"]},
     {"project": "black", "bug": 8, "venv": "black_4", "packages": ["black", "blib2to3"]},
+    {"project": "black", "bug": 9, "venv": "black_4", "packages": ["black", "blib2to3"]},
     {"project": "black", "bug": 10, "venv": "black_4", "packages": ["black", "blib2to3"]},
     {"project": "black", "bug": 11, "venv": "black_4", "packages": ["black", "blib2to3"]},
     {"project": "black", "bug": 12, "venv": "black_4", "packages": ["black", "blib2to3"]},
@@ -54,6 +59,7 @@ BUGS = [
     {"project": "black", "bug": 16, "venv": "black_4", "packages": ["black", "blib2to3"]},
     {"project": "black", "bug": 17, "venv": "black_4", "packages": ["black", "blib2to3"]},
     {"project": "black", "bug": 18, "venv": "black_4", "packages": ["black", "blib2to3"]},
+    {"project": "black", "bug": 20, "venv": "black_4", "packages": ["black", "blib2to3"]},
     {"project": "black", "bug": 21, "venv": "black_4", "packages": ["black", "blib2to3"]},
     {"project": "black", "bug": 23, "venv": "black_4", "packages": ["black", "blib2to3"]},
 ]
@@ -324,11 +330,7 @@ def _select_mutants(
     fault_lines_set: set[int],
     max_mutants: int,
 ) -> list[dict]:
-    """Prioritize mutants on the fault lines, then sample deterministically.
-
-    Retained for tests and the synthetic corpus; ``version_pairs`` now passes
-    the limit and priority lines straight to ``generate_mutants``.
-    """
+    """Prioritize mutants on the fault lines, then sample deterministically."""
     ordered = sorted(
         mutants,
         key=lambda m: (m["line"] not in fault_lines_set, m["line"], m["mutant_id"]),

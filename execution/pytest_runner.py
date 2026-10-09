@@ -50,8 +50,11 @@ def run_pytest(
             capture_output=True,
             text=True,
             env=_subprocess_env(project_dir),
+            timeout=300,
         )
         return _parse_junitxml(xml_path, collected_ok=completed.returncode < 5)
+    except subprocess.TimeoutExpired:
+        return {"_suite_error": "fail"}
     finally:
         xml_path.unlink(missing_ok=True)
 
