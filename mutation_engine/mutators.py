@@ -46,7 +46,15 @@ ASR_OPERATORS = {
     "@=": cst.MatrixMultiplyAssign,
 }
 
-OPERATOR_SETS = (MOR_OPERATORS, ROOR_OPERATORS, COR_OPERATORS)
+BOR_OPERATORS = {
+    "&": cst.BitAnd,
+    "|": cst.BitOr,
+    "^": cst.BitXor,
+    "<<": cst.LeftShift,
+    ">>": cst.RightShift,
+}
+
+OPERATOR_SETS = (MOR_OPERATORS, ROOR_OPERATORS, COR_OPERATORS, BOR_OPERATORS)
 
 CALL_SWAPS = (
     ("np.sum", "np.prod"),
@@ -75,6 +83,7 @@ class Candidate:
     function: str | None
     line: int
     index: int | None = None
+    context: dict | None = None
 
 
 class CandidateVisitor(cst.CSTVisitor):
@@ -86,20 +95,25 @@ class CandidateVisitor(cst.CSTVisitor):
         self._positions = wrapper.resolve(PositionProvider)
         self._parents = wrapper.resolve(ParentNodeProvider)
         self._function_stack: list[str] = []
+        self._scope_stack: list[list[str]] = []  # names per function
         self._unary_depth: int = 0
         self.candidates: list[Candidate] = []
 
     def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:
         self._function_stack.append(node.name.value)
+        self._scope_stack.append([])
         return True
 
     def leave_FunctionDef(self, node: cst.FunctionDef) -> None:
+        self._scope_stack.pop()
         self._function_stack.pop()
 
     def visit_BinaryOperation(self, node: cst.BinaryOperation) -> bool:
         operator = self.module.code_for_node(node.operator).strip()
         if operator in MOR_OPERATORS:
             self._record(node, "MOR", operator, line=self._positions[node.operator].start.line)
+        if operator in BOR_OPERATORS:
+            self._record(node, "BOR", operator, line=self._positions[node.operator].start.line)
         return True
 
     def visit_UnaryOperation(self, node: cst.UnaryOperation) -> bool:
@@ -123,6 +137,17 @@ class CandidateVisitor(cst.CSTVisitor):
                 self._record(
                     node,
                     "ROOR",
+                    operator,
+                    index=index,
+                    line=self._positions[target.operator].start.line,
+                )
+            # EXM: membership/equality expansion. A ``==``/``!=`` comparator
+            # against a literal can become ``in (literal, sibling)``; an
+            # ``in`` over a tuple/set can collapse to ``==`` a single member.
+            if operator in ("==", "!=", "in", "not in"):
+                self._record(
+                    node,
+                    "EXM",
                     operator,
                     index=index,
                     line=self._positions[target.operator].start.line,
@@ -152,6 +177,16 @@ class CandidateVisitor(cst.CSTVisitor):
         if len(positional) > 1:
             for index in positional:
                 self._record(node, "AAR", None, index=index)
+        # SVR: this call is an argument to an outer call -> pulling a
+        # positional arg from the inner call up to the outer call is a
+        # real fault family (e.g. enumerate(tqdm_class(iterable, start)) ->
+        # enumerate(tqdm_class(iterable), start)).
+        parent = self._parents.get(node)
+        if isinstance(parent, cst.Arg):
+            inner_positional = positional
+            if len(inner_positional) >= 2:
+                self._record(node, "SVR", None, line=self._positions[node].start.line,
+                             context={"inner": list(inner_positional)})
         if self._unary_depth == 0 and self._unary_insertable(node):
             self._record(node, "UOI", "insert", line=self._positions[node].start.line)
         return True
@@ -173,11 +208,36 @@ class CandidateVisitor(cst.CSTVisitor):
             self._record(node, "LCR", node.value, line=self._positions[node].start.line)
         if self._unary_depth == 0 and self._unary_insertable(node):
             self._record(node, "UOI", "insert", line=self._positions[node].start.line)
+        # LVR: swap a plain name with another name seen in this function.
+        if self._scope_stack and not node.value.startswith("__") and self._unary_insertable(node):
+            siblings = [n for n in self._scope_stack[-1] if n != node.value]
+            if siblings:
+                self._record(
+                    node, "LVR", node.value, line=self._positions[node].start.line,
+                    context={"siblings": siblings},
+                )
+        if self._scope_stack:
+            self._scope_stack[-1].append(node.value)
         return True
 
     def visit_Attribute(self, node: cst.Attribute) -> bool:
         if self._unary_depth == 0 and self._unary_insertable(node):
             self._record(node, "UOI", "insert", line=self._positions[node].start.line)
+        # LVR-attr: an attribute expression ``x.foo`` -> an in-scope name.
+        if self._scope_stack:
+            siblings = [n for n in self._scope_stack[-1] if n not in ("True", "False", "None")]
+            if siblings:
+                self._record(
+                    node, "LVR", None, line=self._positions[node].start.line,
+                    context={"siblings": siblings},
+                )
+        # ATTR: collapse ``x.foo`` to bare ``x`` (attribute removal). Only safe
+        # for value-position attributes (not ``.foo`` in an assignment target).
+        parent = self._parents.get(node)
+        if self._unary_depth == 0 and not isinstance(
+            parent, (cst.AssignTarget, cst.AnnAssign, cst.AugAssign)
+        ) and isinstance(node.value, (cst.Name, cst.Attribute)):
+            self._record(node, "ATTR", None, line=self._positions[node].start.line)
         return True
 
     def visit_If(self, node: cst.If) -> bool:
@@ -245,6 +305,7 @@ class CandidateVisitor(cst.CSTVisitor):
         *,
         index: int | None = None,
         line: int | None = None,
+        context: dict | None = None,
     ) -> None:
         if line is None:
             line = self._positions[node].start.line
@@ -257,6 +318,7 @@ class CandidateVisitor(cst.CSTVisitor):
                 function=function,
                 line=line,
                 index=index,
+                context=context,
             )
         )
 

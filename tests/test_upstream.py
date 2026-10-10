@@ -7,7 +7,7 @@ import pytest
 
 from execution.runner import baseline_results, mutant_results
 from features.extractor import node_metadata
-from mutation_engine.generator import generate_mutants
+from mutation_engine.generator import candidate_lines, generate_mutants
 from scripts.build_bugs import fault_lines
 from scripts.build_corpus import build_corpus
 from scripts.evaluate_baselines import metallaxis_ranking
@@ -148,6 +148,40 @@ def test_extended_engine_finds_roor_and_cor_mutants():
     assert "COR" in types
     for mutant in mutants:
         compile(mutant["source"], "<mutant>", "exec")
+
+
+def test_sampling_is_fault_agnostic_and_deterministic():
+    """Limited mutant sampling must not starve any mutatable line.
+
+    The old ``priority_lines`` ordering put fault lines first, so with a cap the
+    early lines monopolized the budget and later lines were never sampled.
+    Uniform seeded sampling gives every mutatable line a fair chance.
+    """
+    source = (
+        "def f(x, n):\n"
+        "    total = 0\n"
+        "    for i in range(n):\n"
+        "        total += x[i] % 3\n"
+        "    if total > 5:\n"
+        "        return total - x\n"
+        "    return -x\n"
+    )
+    all_lines = candidate_lines(source)
+    assert len(all_lines) >= 3  # multiple mutatable lines to sample from
+
+    # Across many seeds, every mutatable line appears in some limited sample.
+    # The old priority ordering would have starved high line numbers entirely.
+    seen: set[int] = set()
+    for seed in range(50):
+        seen.update(m["line"] for m in generate_mutants(source, limit=5, seed=seed))
+    assert all_lines <= seen, f"lines never sampled: {sorted(all_lines - seen)}"
+
+    # Determinism: same seed -> same mutant set regardless of runtime order.
+    a = [m["line"] for m in generate_mutants(source, limit=5, seed=7)]
+    b = [m["line"] for m in generate_mutants(source, limit=5, seed=7)]
+    assert a == b
+    c = [m["line"] for m in generate_mutants(source, limit=5, seed=8)]
+    assert a != c
 
 
 def test_new_operators_scp_cdr_arc_and_float_lcr():

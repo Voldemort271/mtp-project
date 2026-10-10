@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import re
 import shutil
@@ -68,8 +69,16 @@ BUGS = [
 CONFTEST_PATCH = "request.node.get_marker('functional')"
 CONFTEST_REPLACEMENT = "request.node.get_closest_marker('functional')"
 
+_STABLE_MAX_ATTEMPTS = 3
+
 HUNK_RE = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 TARGET_RE = re.compile(r"::([\w]+)")
+
+
+def _stable_seed(*parts: str) -> int:
+    """Deterministic, fault-independent seed for reproducible mutant sampling."""
+    digest = hashlib.sha256("::".join(parts).encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big")
 
 
 def prepare_checkout(checkout: Path, project: str) -> None:
@@ -230,46 +239,55 @@ def _stable_results(
     checkout: Path,
     tests: list[str],
     python: Path,
-    max_attempts: int = 3,
-) -> dict[str, str]:
+    max_attempts: int = _STABLE_MAX_ATTEMPTS,
+) -> tuple[dict[str, str], int]:
     """Run a mutant's tests until two runs agree; drop per-test flakiness.
 
-    Returns only the tests whose outcome is stable across attempts. A test that
-    keeps disagreeing is omitted so it never enters the corpus.
+    Returns ``(outcomes, attempts_used)`` where ``outcomes`` contains only the
+    tests whose result is stable across runs (tests that keep disagreeing are
+    omitted), and ``attempts_used`` is the number of pytest runs performed
+    (``max_attempts`` if the mutant never produced two consecutive identical
+    runs and fell through to vote-tallying).
     """
     attempts = []
     for _ in range(max_attempts):
         result = run_pytest(checkout, tests, python)
         attempts.append(result)
         if len(attempts) >= 2 and attempts[-1] == attempts[-2]:
-            return result
+            return result, len(attempts)
     stable = {}
     for test_id in tests:
         votes = Counter(attempt.get(test_id) for attempt in attempts)
         outcome, count = votes.most_common(1)[0]
         if count >= 2:
             stable[test_id] = outcome
-    return stable
+    return stable, len(attempts)
 
 
 def version_pairs(
     checkout: Path,
     relative_file: str,
     *,
-    fault_lines_set: set[int],
     tests: list[str],
     python: Path,
     source_packages: list[str],
     max_mutants: int,
     version_name: str,
-) -> tuple[list[dict], int]:
-    """Run all selected mutants of one file and label every test–mutant pair."""
+) -> tuple[list[dict], int, int]:
+    """Run all selected mutants of one file and label every test–mutant pair.
+
+    Returns ``(rows, flaky_cells, ceiling_hits)`` where ``ceiling_hits`` counts
+    mutants whose stability check ran the full ``max_attempts`` because two
+    consecutive runs never agreed.
+    """
     path = checkout / relative_file
     original = path.read_text()
+    # Fault-agnostic sampling: a seed fixed per (version, file) keeps the
+    # retained mutant set deterministic and independent of fault locations.
     mutants = generate_mutants(
         original,
         limit=max_mutants,
-        priority_lines=frozenset(fault_lines_set),
+        seed=_stable_seed(version_name, relative_file),
     )
 
     baseline_results = run_pytest(checkout, tests, python)
@@ -282,13 +300,16 @@ def version_pairs(
 
     rows: list[dict] = []
     flaky_cells = 0
+    ceiling_hits = 0
     for index, mutant in enumerate(mutants):
         path.write_text(mutant["source"])
         try:
-            mutant_results = _stable_results(checkout, tests, python)
+            mutant_results, attempts_used = _stable_results(checkout, tests, python)
         finally:
             path.write_text(original)
             _clean_sandbox_state(checkout)
+        if attempts_used >= _STABLE_MAX_ATTEMPTS:
+            ceiling_hits += 1
         flaky_cells += sum(
             1 for test_id in tests if test_id not in mutant_results
         )
@@ -322,27 +343,14 @@ def version_pairs(
                     "outcome_changed": int(mutant_result != baseline_result),
                 }
             )
-    return rows, flaky_cells
-
-
-def _select_mutants(
-    mutants: list[dict],
-    fault_lines_set: set[int],
-    max_mutants: int,
-) -> list[dict]:
-    """Prioritize mutants on the fault lines, then sample deterministically."""
-    ordered = sorted(
-        mutants,
-        key=lambda m: (m["line"] not in fault_lines_set, m["line"], m["mutant_id"]),
-    )
-    return ordered[:max_mutants]
+    return rows, flaky_cells, ceiling_hits
 
 
 def _version_task(spec: dict, tests: list[str], is_fixed: bool, task_index: int):
     """Build one source version's rows in its own sandbox (a parallel unit)."""
     project = spec["project"]
     bug = spec["bug"]
-    max_mutants = spec.get("max_mutants", 60)
+    max_mutants = spec.get("max_mutants", 300)
     python = WORK / spec["venv"] / "venv" / "bin" / "python"
     source_packages = spec["packages"]
     bug_dir = BUGS_ROOT / project / "bugs" / str(bug)
@@ -358,11 +366,11 @@ def _version_task(spec: dict, tests: list[str], is_fixed: bool, task_index: int)
     rows: list[dict] = []
     fault_rows: list[dict] = []
     flaky = 0
+    ceiling_hits = 0
     for relative_file, lines in faults.items():
-        version_rows, version_flaky = version_pairs(
+        version_rows, version_flaky, version_ceiling = version_pairs(
             sandbox,
             relative_file,
-            fault_lines_set=set(lines) if not is_fixed else set(),
             tests=tests,
             python=python,
             source_packages=source_packages,
@@ -371,12 +379,13 @@ def _version_task(spec: dict, tests: list[str], is_fixed: bool, task_index: int)
         )
         rows.extend(version_rows)
         flaky += version_flaky
+        ceiling_hits += version_ceiling
         if not is_fixed:
             fault_rows.extend(
                 {"source_version": version_name, "fault_line": line}
                 for line in lines
             )
-    return rows, fault_rows, flaky
+    return rows, fault_rows, flaky, ceiling_hits
 
 
 def build_corpus(
@@ -388,6 +397,7 @@ def build_corpus(
     rows: list[dict] = []
     fault_rows: list[dict] = []
     total_flaky = 0
+    total_ceiling = 0
 
     tasks: list[tuple] = []
     for spec in bugs or BUGS:
@@ -413,19 +423,26 @@ def build_corpus(
         with ProcessPoolExecutor(max_workers=workers) as executor:
             futures = [executor.submit(_version_task, *task) for task in tasks]
             for future in futures:
-                version_rows, version_faults, flaky = future.result()
+                version_rows, version_faults, flaky, ceiling = future.result()
                 rows.extend(version_rows)
                 fault_rows.extend(version_faults)
                 total_flaky += flaky
+                total_ceiling += ceiling
     else:
         for task in tasks:
-            version_rows, version_faults, flaky = _version_task(*task)
+            version_rows, version_faults, flaky, ceiling = _version_task(*task)
             rows.extend(version_rows)
             fault_rows.extend(version_faults)
             total_flaky += flaky
+            total_ceiling += ceiling
 
     if total_flaky:
         print(f"Dropped {total_flaky} flaky (mutant, test) cells.")
+    if total_ceiling:
+        print(
+            f"{total_ceiling} mutants hit the {_STABLE_MAX_ATTEMPTS}-attempt "
+            f"stability ceiling (no two consecutive runs agreed)."
+        )
 
     out_dir.mkdir(parents=True, exist_ok=True)
     pairs = pd.DataFrame(rows)

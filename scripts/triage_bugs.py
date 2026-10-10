@@ -12,7 +12,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from execution.pytest_runner import run_pytest
-from mutation_engine.generator import generate_mutants
+from mutation_engine.generator import candidate_lines
 from scripts.build_bugs import BUGS_ROOT, WORK, fault_lines, prepare_checkout, select_tests
 
 
@@ -41,12 +41,8 @@ def triage(project: str, bug: int, venv: str) -> dict:
         if not src_path.exists():
             mutatable[file] = []
             continue
-        mutants = generate_mutants(
-            src_path.read_text(), limit=60, priority_lines=frozenset(lines)
-        )
-        mutatable[file] = sorted(
-            set(lines) & {m["line"] for m in mutants}
-        )
+        mutants = candidate_lines(src_path.read_text())
+        mutatable[file] = sorted(set(lines) & mutants)
 
     any_mutatable = any(mutatable.values())
     keep = bool(failing) and fixed_pass > 0 and any_mutatable

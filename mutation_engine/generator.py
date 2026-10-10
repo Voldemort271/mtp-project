@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import random
+
 import libcst as cst
 import numpy as np
 from libcst.metadata import MetadataWrapper
 
 from .mutators import (
     ASR_OPERATORS,
+    BOR_OPERATORS,
     CALL_SWAPS,
     CandidateVisitor,
     MOR_OPERATORS,
@@ -26,11 +29,21 @@ def _parse(source_text: str) -> tuple[cst.Module, MetadataWrapper, CandidateVisi
     return wrapper.module, wrapper, visitor
 
 
+def candidate_lines(source_text: str) -> set[int]:
+    """Return the set of source lines that have at least one mutation candidate.
+
+    Used for triage/diagnostics; it does not serialize any mutant.
+    """
+    _module, _wrapper, visitor = _parse(source_text)
+    return {candidate.line for candidate in visitor.candidates}
+
+
 def generate_mutants(
     source_text: str,
     *,
     limit: int | None = None,
-    priority_lines: frozenset[int] = frozenset(),
+    seed: int = 0,
+    mode: str = "uniform",
 ) -> list[dict]:
     """Return one entry per distinct mutant.
 
@@ -38,25 +51,42 @@ def generate_mutants(
     ``function``, and ``source``. Mutants whose source is unchanged or already
     seen are dropped.
 
-    ``limit`` stops generation early (candidates on ``priority_lines`` first),
-    which matters for large files where full generation re-serializes the
-    module once per candidate.
+    When ``limit`` is set, the retained mutant set is independent of any
+    downstream fault labels and of source-line ordering (seeded by ``seed``),
+    and is deterministic for a given source and seed.
+
+    ``mode`` selects how the budget is spent when ``limit`` is set:
+    - ``"uniform"``: candidates are shuffled and the first ``limit`` distinct
+      mutants are kept. Lines with more mutation sites win more budget, which
+      is legitimate (complex lines hold more real faults) but covers fewer
+      distinct lines in large files.
+    - ``"stratified_floor"``: candidates are round-robin'd across lines, taking
+      at most one distinct mutant per candidate before moving on, so the budget
+      covers as many distinct lines as possible before deepening any line. This
+      maximizes fault-line coverage but reduces per-line mutant density.
+
+    The default remains fault-agnostic uniform sampling.
     """
     module, wrapper, visitor = _parse(source_text)
 
     candidates = sorted(
         visitor.candidates,
-        key=lambda c: (
-            c.line not in priority_lines,
-            c.line,
-            c.index if c.index is not None else -1,
-        ),
+        key=lambda c: (c.line, c.index if c.index is not None else -1),
     )
+    if limit is None:
+        candidates = list(candidates)
+    elif mode == "uniform":
+        random.Random(seed).shuffle(candidates)
+    elif mode == "stratified_floor":
+        candidates = _round_robin_candidates(candidates, seed)
+    else:
+        raise ValueError(f"Unknown mode {mode!r}")
 
     mutants: list[dict] = []
     seen_sources: set[str] = set()
     for candidate in candidates:
         operator = candidate.detail or "reshape"
+        yielded = False
         for detail, replacement in _replacements(module, candidate):
             mutant_module = _apply(module, candidate.node, replacement)
             new_source = mutant_module.code
@@ -77,9 +107,43 @@ def generate_mutants(
                     "source": new_source,
                 }
             )
+            yielded = True
             if limit is not None and len(mutants) >= limit:
                 return mutants
+            if mode == "stratified_floor":
+                # at most one distinct mutant per candidate: maximize line spread
+                break
+        _ = yielded
     return mutants
+
+
+def _round_robin_candidates(
+    candidates: list[Candidate], seed: int
+) -> list[Candidate]:
+    """Order candidates line-by-line, round-robin, deterministic per seed.
+
+    Every mutatable line contributes one candidate before any line contributes
+    a second, which spreads a fixed mutant budget across the most lines.
+    """
+    rng = random.Random(seed + 1)
+    by_line: dict[int, list[Candidate]] = {}
+    for candidate in candidates:
+        by_line.setdefault(candidate.line, []).append(candidate)
+    lines = sorted(by_line)
+    for line in lines:
+        rng.shuffle(by_line[line])
+    ordered: list[Candidate] = []
+    index = 0
+    while True:
+        advanced = False
+        for line in lines:
+            if index < len(by_line[line]):
+                ordered.append(by_line[line][index])
+                advanced = True
+        if not advanced:
+            break
+        index += 1
+    return ordered
 
 
 def _replacements(module: cst.Module, candidate: Candidate):
@@ -163,6 +227,112 @@ def _replacements(module: cst.Module, candidate: Candidate):
     elif candidate.mutation_type == "RTR":
         for detail, value in RTR_REPLACEMENTS:
             yield detail, cst.Return(value=value)
+    elif candidate.mutation_type == "EXM":
+        yield from _membership_replacements(module, node, candidate)
+    elif candidate.mutation_type == "BOR":
+        operator_name = candidate.detail
+        for name, operator_class in BOR_OPERATORS.items():
+            if name == operator_name:
+                continue
+            yield name, cst.BinaryOperation(
+                left=node.left,
+                operator=operator_class(),
+                right=node.right,
+            )
+    elif candidate.mutation_type == "LVR":
+        siblings = (candidate.context or {}).get("siblings", [])
+        if isinstance(node, cst.Attribute):
+            for sib in siblings:
+                yield f"name-{sib}", cst.Name(sib)
+        else:
+            for sib in siblings:
+                yield f"name-{sib}", cst.Name(sib)
+    elif candidate.mutation_type == "ATTR":
+        # collapse ``x.foo`` -> ``x``
+        yield "drop-attr", node.value
+    elif candidate.mutation_type == "SVR":
+        # pull the (first two) positional args out of the inner call up to the
+        # enclosing call. candidate.node is the inner call; its parent Arg is
+        # removed and replaced by a bare call of the remaining args.
+        inner = len((candidate.context or {}).get("inner", []))
+        if inner >= 2:
+            # keep only arg[0] inside inner; the rest would be moved (multi-arg
+            # move is complex), so we move the LAST inner positional to the end
+            # of the outer call.
+            positional = [
+                i for i, arg in enumerate(node.args)
+                if arg.keyword is None and arg.star == ""
+            ]
+            if len(positional) >= 2:
+                dropped = positional[-1]
+                args = [arg for i, arg in enumerate(node.args) if i != dropped]
+                yield "shift-arg-inner", cst.Call(func=node.func, args=args)
+
+
+def _membership_replacements(module: cst.Module, node, candidate):
+    """Expand ``== lit`` to membership and collapse ``in (...)`` to equality.
+
+    Expresses the common fault family "single equality should have been a set
+    membership" (e.g. ``token == 'def'`` -> ``token in ('def', 'for')``) and
+    its reverse (``in (a, b)`` -> ``== a``).
+    """
+    target = node.comparisons[candidate.index]
+    operator = module.code_for_node(target.operator).strip()
+    comparator = target.comparator
+    # left operand of this comparison step (node.left for the first, else the
+    # previous step's comparator)
+    if candidate.index == 0:
+        left = node.left
+    else:
+        left = node.comparisons[candidate.index - 1].comparator
+
+    def rebuilt(op, right):
+        new_target = cst.ComparisonTarget(operator=op, comparator=right)
+        comparisons = list(node.comparisons)
+        comparisons[candidate.index] = new_target
+        return cst.Comparison(left=node.left, comparisons=comparisons)
+
+    if operator in ("==", "!="):
+        # right-hand side is a literal / name / tuple: expand to membership
+        if isinstance(comparator, (cst.Integer, cst.Float, cst.SimpleString, cst.Name)):
+            member = comparator
+            in_op = cst.In() if operator == "==" else cst.NotIn()
+            # (x) == lit  ->  x in (lit,)
+            yield "in-single", rebuilt(in_op, _as_tuple(module, member))
+        elif isinstance(comparator, (cst.Tuple, cst.List, cst.Set)):
+            elements = _container_elements(comparator)
+            if len(elements) == 1 and operator == "==":
+                yield "in-single", rebuilt(cst.In(), elements[0])
+            elif len(elements) >= 2:
+                # membership of x among some members -> equality with first
+                yield "==first", rebuilt(cst.Equal(), elements[0])
+    elif operator in ("in", "not in"):
+        if isinstance(comparator, (cst.Tuple, cst.List, cst.Set)):
+            elements = _container_elements(comparator)
+            if len(elements) == 1:
+                yield "==member", rebuilt(cst.Equal(), elements[0])
+            elif len(elements) >= 2:
+                yield "==first", rebuilt(cst.Equal(), elements[0])
+        elif isinstance(comparator, (cst.Integer, cst.Float, cst.SimpleString, cst.Name)):
+            # x in lit  ->  x == lit
+            yield "==member", rebuilt(cst.Equal(), comparator)
+
+
+def _as_tuple(module: cst.Module, expression) -> cst.BaseExpression:
+    if isinstance(expression, cst.Tuple):
+        return expression
+    # wrap a single lit/name into a one-element tuple: (lit,)
+    return cst.Tuple(elements=[cst.Element(value=expression)])
+
+
+def _container_elements(container) -> list:
+    if isinstance(container, cst.Tuple):
+        return [e.value for e in container.elements]
+    if isinstance(container, cst.List):
+        return [e.value for e in container.elements]
+    if isinstance(container, cst.Set):
+        return [e.value for e in container.elements]
+    return []
 
 
 def _string_replacements(node: cst.SimpleString):
@@ -194,6 +364,70 @@ def _string_replacements(node: cst.SimpleString):
         if replacement == value:
             continue
         yield detail, cst.SimpleString(repr(replacement))
+
+    # Regex-aware string mutations: if the literal looks like a regex pattern
+    # (anchors, character classes, escapes, quantifiers), perturb its
+    # metacharacters. This expresses the thefuck regex faults (e.g. ``[a-z]+``
+    # vs ``[^"]+``, ``^mkdir`` vs ``\\bmkdir``).
+    if _looks_like_regex(value):
+        yield from _regex_string_replacements(value)
+
+
+def _looks_like_regex(value: str) -> bool:
+    return any(ch in value for ch in "^$[].*+?()|\\{}")
+
+
+def _regex_string_replacements(value: str):
+    """Yield regex-metacharacter perturbations for a string literal."""
+    candidates: list[tuple[str, str]] = []
+
+    # anchor <-> word-boundary: ^x <-> \bx, x$ <-> x\b
+    if value.startswith("^") and "\\b" not in value[:3]:
+        candidates.append(("^->\\b", "\\b" + value[1:]))
+    if "\\b" in value and value.startswith("\\b"):
+        candidates.append(("\\b->^", "^" + value[2:]))
+    if value.endswith("$"):
+        candidates.append(("$->\\b", value[:-1] + "\\b"))
+
+    # negate character classes [a-z] -> [^a-z]
+    import re as _re
+
+    def negate_class(match: _re.Match) -> str:
+        inner = match.group(1)
+        return "[^" + inner + "]"
+
+    value_neg = _re.sub(r"\[(\^?[^\]]+)\]", negate_class, value, count=3)
+    if value_neg != value:
+        candidates.append(("negate-class", value_neg))
+
+    # quantifier swap + <-> *
+    value1 = value.replace("+", "*")
+    if value1 != value:
+        candidates.append(("+->*", value1))
+    value2 = value.replace("*", "+", 1)
+    if value2 != value:
+        candidates.append(("first-*->+", value2))
+
+    # escape/un-escape grouping parens: \\( -> ( and ( -> \\(
+    value3 = value.replace("\\)", ")").replace("\\(", "(")
+    if value3 != value:
+        candidates.append(("unescape-parens", value3))
+    escaped = value.replace("(", "\\(").replace(")", "\\)")
+    if escaped != value:
+        candidates.append(("escape-parens", escaped))
+
+    # char-class shortcut swap \d <-> \w, \s <-> \S, etc.
+    for esc_from, esc_to in (("\\d", "\\w"), ("\\w", "\\d"), ("\\s", "\\S"), ("\\S", "\\s")):
+        swapped = value.replace(esc_from, esc_to)
+        if swapped != value:
+            candidates.append((f"{esc_from}->{esc_to}", swapped))
+
+    seen = set()
+    for detail, replacement in candidates:
+        if replacement == value or replacement in seen:
+            continue
+        seen.add(replacement)
+        yield str(detail), cst.SimpleString(repr(replacement))
 
 
 def _int_node(value: int) -> cst.BaseExpression:

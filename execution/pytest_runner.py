@@ -3,12 +3,33 @@
 from __future__ import annotations
 
 import os
+import resource
 import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import coverage
+
+# Cap a single mutant's address space so a pathological mutant (e.g. a
+# MOR-induced ``x ** huge`` producing an astronomical bignum, or a runaway
+# string) is killed with MemoryError instead of exhausting the whole machine.
+# Without this, one mutant can allocate >10 GB in seconds and trigger the OS
+# OOM killer before the wall-clock timeout can intervene. A normal pytest run
+# for these suites peaks at ~120 MB VSZ, so 1 GB is ~8x headroom and never
+# affects legitimate mutants, while 4 workers stay well within 14 GB RAM.
+MUTANT_MEMORY_LIMIT_BYTES = 1 * 1024**3
+
+
+def _limit_address_space() -> None:
+    """``preexec_fn`` that caps the child's address space."""
+    try:
+        resource.setrlimit(
+            resource.RLIMIT_AS,
+            (MUTANT_MEMORY_LIMIT_BYTES, MUTANT_MEMORY_LIMIT_BYTES),
+        )
+    except (ValueError, OSError):
+        pass
 
 
 def run_pytest(
@@ -21,6 +42,10 @@ def run_pytest(
     Any collected test that fails or errors is reported as ``fail``. If the
     whole run errors before collecting tests, ``{'_suite_error': 'fail'}`` is
     returned so callers can treat collection/import breakage as a failure.
+
+    The child is memory- and time-bounded (see ``MUTANT_MEMORY_LIMIT_BYTES``
+    and ``timeout``) and its stdout/stderr are discarded, so a single runaway
+    mutant cannot accumulate gigabytes of buffered output or exhaust system RAM.
     """
     with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as handle:
         xml_path = Path(handle.name)
@@ -47,10 +72,11 @@ def run_pytest(
         completed = subprocess.run(
             command,
             cwd=project_dir,
-            capture_output=True,
-            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             env=_subprocess_env(project_dir),
             timeout=300,
+            preexec_fn=_limit_address_space,
         )
         return _parse_junitxml(xml_path, collected_ok=completed.returncode < 5)
     except subprocess.TimeoutExpired:

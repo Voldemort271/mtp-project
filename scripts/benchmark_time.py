@@ -50,7 +50,7 @@ def _time_bug(spec: dict) -> dict:
 
     t0 = time.perf_counter()
     mutants = generate_mutants(
-        original, limit=LIMIT, priority_lines=frozenset()
+        original, limit=LIMIT
     )
     t_generate = time.perf_counter() - t0
 
