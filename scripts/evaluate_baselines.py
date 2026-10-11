@@ -19,7 +19,6 @@ from ml_pmt import OutcomeChangeModel, predict_and_rank
 from ml_pmt.ranker import line_aggregates
 from scripts.build_bugs import BUGS, BUGS_ROOT, WORK, make_sandbox, select_tests
 from scripts.evaluate_localization import (
-    apply_full_universe_floor,
     honest_two_stage_ranking,
     rank_metrics,
 )
@@ -314,18 +313,6 @@ def main() -> int:
             baseline=baseline,
             random_state=args.seed,
         )
-        # B1a: full-universe rankings (every covered line rankable via the
-        # Ochiai floor appended to the mutant-line ranking).
-        if "spectrum" in locals():
-            rankings["ML-PMT full-univ (pred)"] = apply_full_universe_floor(
-                rankings["ML-PMT (predicted)"], spectrum
-            )
-            rankings["ML-PMT full-univ (2stg)"] = apply_full_universe_floor(
-                rankings["ML-PMT (two-stage)"], spectrum
-            )
-        else:
-            rankings["ML-PMT full-univ (pred)"] = rankings["ML-PMT (predicted)"]
-            rankings["ML-PMT full-univ (2stg)"] = rankings["ML-PMT (two-stage)"]
 
         for method, ranking in rankings.items():
             metrics = rank_metrics(ranking, fault_lines)
@@ -364,7 +351,6 @@ def main() -> int:
         time_s=("time_s", "mean"),
     ).reindex(
         ["Hybrid (SBFL+pred)", "ML-PMT (predicted)", "ML-PMT (two-stage)",
-         "ML-PMT full-univ (pred)", "ML-PMT full-univ (2stg)",
          "ML-PMT full-univ (2stg-learned)",
          "MBFL-real (Metallaxis)", "SBFL-ochiai", "SBFL-tarantula"]
     ).round(3)
@@ -385,7 +371,6 @@ def main() -> int:
             exam=("exam", "mean"),
         ).reindex(
             ["Hybrid (SBFL+pred)", "ML-PMT (predicted)", "ML-PMT (two-stage)",
-             "ML-PMT full-univ (pred)", "ML-PMT full-univ (2stg)",
              "ML-PMT full-univ (2stg-learned)",
              "MBFL-real (Metallaxis)", "SBFL-ochiai", "SBFL-tarantula"]
         ).round(3)

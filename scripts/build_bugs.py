@@ -195,7 +195,55 @@ def select_tests(
     if not failing:
         raise RuntimeError(f"No failing test on {checkout}")
     passing = [tid for tid, result in results.items() if result == "pass"][:6]
-    return failing + passing, failing
+    selected = failing + passing
+    # Validate the combined nodeid list actually collects. A bug's module can
+    # collect as a whole while *some individual nodeids* (often module-level
+    # targets like ``tests.python2``) error when run in a selected list,
+    # which turns every mutant run into ``_suite_error`` and loses the bug
+    # entirely. Trim non-collectable members (prefer keeping failing ones).
+    selected = _collectable_subset(checkout, selected, python)
+    keep_failing = [tid for tid in failing if tid in set(selected)]
+    if not keep_failing:
+        raise RuntimeError(f"No collectable failing test on {checkout}")
+    return selected, keep_failing
+
+
+def _collectable_subset(
+    checkout: Path, test_ids: list[str], python: Path
+) -> list[str]:
+    """Return a subset of ``test_ids`` that pytest can collect together.
+
+    Runs the full list; on ``_suite_error`` retries by removing candidate
+    members until the list collects. Failing tests are checked first (kept);
+    if none are individually collectable, use the best-effort module set.
+    """
+    if not test_ids:
+        return []
+    run_once = run_pytest(checkout, test_ids, python)
+    if "_suite_error" not in run_once:
+        return test_ids
+
+    # Try each member alone to find the collective-error trigger.
+    collectable = []
+    for tid in set(test_ids):
+        solo = run_pytest(checkout, [tid], python)
+        if "_suite_error" not in solo:
+            collectable.append(tid)
+    if not collectable:
+        # Fall back to re-collecting the module list (already known okay).
+        return list(dict.fromkeys(test_ids))
+    # Greedy: add back members until something breaks, keep the largest
+    # prefix that still collects (deterministic order).
+    chosen: list[str] = []
+    for tid in test_ids:
+        if tid not in collectable:
+            continue
+        trial = chosen + [tid]
+        res = run_pytest(checkout, trial, python)
+        if "_suite_error" in res:
+            break
+        chosen = trial
+    return chosen or (collectable[:1] if collectable else [])
 
 
 def _test_modules(test_file: str) -> list[str]:
@@ -304,6 +352,11 @@ def version_pairs(
     )
 
     baseline_results = run_pytest(checkout, tests, python)
+    if "_suite_error" in baseline_results:
+        raise RuntimeError(
+            f"[{version_name}::{relative_file}] baseline test collection failed; "
+            f"tests={len(tests)} — refusing to emit phantom zero-row variant"
+        )
     coverage = coverage_by_test(
         checkout,
         tests,
