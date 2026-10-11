@@ -17,6 +17,50 @@ from ml_pmt.ranker import LINE_FEATURE_COLUMNS, TwoStageRanker, line_aggregates
 from sklearn.ensemble import RandomForestClassifier
 
 
+def apply_full_universe_floor(
+    ranking: pd.DataFrame,
+    spectrum: pd.DataFrame,
+) -> pd.DataFrame:
+    """B1a: full-universe scoring via max(normalize(mutation), normalize(ochiai)).
+
+    ``ranking`` is ``{line_number, suspiciousness}`` over mutant lines (the
+    learned/Arar formula score). ``spectrum`` is the SBFL frame with
+    ``line_number`` and ``ochiai`` for the full covered universe.
+
+    To combine the two on a common scale, each is min-max normalized over its
+    own universe, then a line's final suspiciousness is the max of the two (the
+    same fusion as the Hybrid). A non-mutant line therefore keeps its coverage
+    score and is always rankable — so the fault line is never absent from the
+    ranking just because it has no mutant (B1a).
+    """
+    if ranking is None or ranking.empty:
+        return ranking
+    if spectrum is None or spectrum.empty:
+        return ranking
+    spec = spectrum.loc[:, ["line_number", "ochiai"]].copy()
+
+    def _norm(s: pd.Series) -> pd.Series:
+        spread = s.max() - s.min()
+        return (s - s.min()) / spread if spread > 0 else s * 0.0
+
+    mut = ranking.loc[:, ["line_number", "suspiciousness"]].copy()
+    mut["suspiciousness"] = _norm(mut["suspiciousness"].astype(float))
+    spec["ochiai"] = _norm(spec["ochiai"].astype(float))
+
+    merged = spec.rename(columns={"ochiai": "ochiai_n"})
+    merged = merged.merge(
+        mut, on="line_number", how="outer"
+    )
+    merged["suspiciousness"] = merged[
+        ["ochiai_n", "suspiciousness"]
+    ].max(axis=1)
+    return merged.loc[:, ["line_number", "suspiciousness"]].sort_values(
+        ["suspiciousness", "line_number"],
+        ascending=[False, True],
+        ignore_index=True,
+    )
+
+
 def rank_metrics(ranking: pd.DataFrame, fault_lines: list[int]) -> dict:
     """Compute ranking metrics for known fault lines (best rank wins)."""
     lines = ranking["line_number"].tolist()

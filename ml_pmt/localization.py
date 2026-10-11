@@ -11,6 +11,8 @@ import pandas as pd
 def rank_suspicious_lines(
     pair_predictions: pd.DataFrame,
     baseline_test_results: Mapping[str, str],
+    *,
+    universe: dict[int, float] | None = None,
 ) -> pd.DataFrame:
     """Rank source lines using expected per-test outcome-change probabilities.
 
@@ -18,6 +20,11 @@ def rank_suspicious_lines(
     ``probability`` columns. If multiple mutants target one line, the maximum
     probability per (line, test) is used, as specified for version 1 in the
     project design. Tests absent from a line's prediction rows contribute 0.
+
+    When ``universe`` is given (``{line: ochiai_score}`` for the full covered
+    line set), lines with no mutants are appended with their Ochiai score as
+    the suspiciousness floor, so every covered line is ranked (B1a
+    full-universe scoring).
     """
     required = {"line_number", "test_id", "probability"}
     missing = required.difference(pair_predictions.columns)
@@ -93,8 +100,34 @@ def rank_suspicious_lines(
             }
         )
 
-    return pd.DataFrame(rows).sort_values(
+    ranked = pd.DataFrame(rows).sort_values(
         ["suspiciousness", "line_number"],
         ascending=[False, True],
         ignore_index=True,
     )
+    if universe:
+        # B1a fallback: merge in non-mutant covered lines. Kept consistent with
+        # ``apply_full_universe_floor``: each signal min-max normalized, then
+        # max fused. (The script path uses apply_full_universe_floor directly;
+        # this keeps the library self-consistent if called standalone.)
+        ranked["suspiciousness"] = _normalize(ranked["suspiciousness"])
+        covered = pd.DataFrame(
+            [{"line_number": line, "ochiai": score}
+             for line, score in universe.items()]
+        )
+        covered["ochiai"] = _normalize(covered["ochiai"])
+        merged = covered.merge(
+            ranked[["line_number", "suspiciousness"]], on="line_number", how="outer"
+        )
+        merged["suspiciousness"] = merged[["ochiai", "suspiciousness"]].max(axis=1)
+        return merged.loc[:, ["line_number", "suspiciousness"]].sort_values(
+            ["suspiciousness", "line_number"],
+            ascending=[False, True],
+            ignore_index=True,
+        )
+    return ranked
+
+
+def _normalize(series: "pd.Series") -> "pd.Series":
+    spread = series.max() - series.min()
+    return (series - series.min()) / spread if spread > 0 else series * 0.0

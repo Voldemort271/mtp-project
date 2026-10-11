@@ -106,6 +106,56 @@ def _dstar(a: int, b: int, c: int) -> float:
     return float((a * a) / denominator) if denominator > 0 else float(a) if a else 0.0
 
 
+def extend_to_full_universe(
+    aggregates: pd.DataFrame,
+    universe: dict[int, dict],
+) -> pd.DataFrame:
+    """Append non-mutant coverage-universe rows to a mutant-lines frame.
+
+    ``universe`` maps ``line -> {a: int, b: int, ochiai: float, ...}`` for every
+    covered line. Lines already in ``aggregates`` keep their full mutation
+    features and are scored by the learned ranker. Other lines (no mutant) are
+    appended with ``is_universe_only=1`` and zero mutation signal, so the
+    caller can give them a coverage-based floor score (B1a full-universe
+    ranking); the RF never extrapolates onto unobserved mutation features.
+    """
+    existing = set(aggregates["line_number"])
+    missing = [line for line in sorted(universe) if line not in existing]
+    if not missing:
+        if aggregates.get("is_universe_only") is None:
+            aggregates = aggregates.copy()
+            aggregates["is_universe_only"] = 0
+        return aggregates
+    rows = []
+    for line in missing:
+        u = universe[line]
+        a = int(u.get("a", 0))
+        b = int(u.get("b", 0))
+        rows.append(
+            {
+                "line_number": line,
+                "f_killed": 0.0,
+                "p_killed": 0.0,
+                "n_mutants": 0,
+                "n_failing_cover": a,
+                "n_passing_cover": b,
+                "max_failing_prob": 0.0,
+                "mean_failing_prob": 0.0,
+                "frac_failing_high": 0.0,
+                "n_failing": 0,
+                "n_passing": 0,
+                "ochiai": float(u.get("ochiai", _ochiai(a, b, 0))),
+                "tarantula": float(u.get("tarantula", _tarantula(a, b, 0, 0))),
+                "dstar": float(u.get("dstar", _dstar(a, b, 0))),
+                "is_universe_only": 1,
+            }
+        )
+    out = pd.concat([aggregates, pd.DataFrame(rows)], ignore_index=True)
+    if out.get("is_universe_only") is None:
+        out["is_universe_only"] = 0
+    return out
+
+
 class TwoStageRanker:
     """Predict pair outcomes, then learn a line-level suspiciousness score."""
 
@@ -154,16 +204,43 @@ class TwoStageRanker:
         self,
         candidates: pd.DataFrame,
         baseline_test_results: dict[str, str],
+        *,
+        universe: dict[int, dict] | None = None,
     ) -> pd.DataFrame:
-        """Predict pair probabilities, score lines, and rank them."""
+        """Predict pair probabilities, score lines, and rank them.
+
+        When ``universe`` is given (``{line: {'a','b','ochiai',...}}`` for the
+        full covered line set), non-mutant lines are appended with zero
+        mutation features and their SBFL coverage features, so every covered
+        line is ranked (B1a full-universe scoring). Mutant lines keep their
+        learned mutation+coverage score.
+        """
         if self.pair_model is None or self.ranker is None:
             raise RuntimeError("Call fit() before predict_and_rank()")
         probabilities = self.pair_model.predict_probabilities(candidates)
         features = line_aggregates(candidates, probabilities)
-        proba = self.ranker.predict_proba(features[LINE_FEATURE_COLUMNS])
-        features["suspiciousness"] = (
-            proba[:, 1] if proba.shape[1] > 1 else proba[:, 0]
-        )
+        if universe:
+            features = extend_to_full_universe(features, universe)
+            # B1a full-universe floor: non-mutant lines are scored by their
+            # normalized Ochiai (coverage) instead of the RF, which only ever
+            # saw mutant-line rows during training.
+            mask = features.get("is_universe_only", pd.Series(0, index=features.index)).fillna(0).astype(bool)
+            if mask.any():
+                ochiai = features.loc[mask, "ochiai"]
+                spread = ochiai.max() - ochiai.min()
+                features.loc[mask, "suspiciousness"] = (
+                    (ochiai - ochiai.min()) / spread if spread > 0 else ochiai * 0.0
+                )
+            mutant_mask = ~mask
+        else:
+            mutant_mask = pd.Series(True, index=features.index)
+        if mutant_mask.any():
+            proba = self.ranker.predict_proba(
+                features.loc[mutant_mask, LINE_FEATURE_COLUMNS]
+            )
+            features.loc[mutant_mask, "suspiciousness"] = (
+                proba[:, 1] if proba.shape[1] > 1 else proba[:, 0]
+            )
         return features.loc[:, ["line_number", "suspiciousness"]].sort_values(
             ["suspiciousness", "line_number"],
             ascending=[False, True],

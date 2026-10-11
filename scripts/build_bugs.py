@@ -81,6 +81,12 @@ def _stable_seed(*parts: str) -> int:
     return int.from_bytes(digest[:8], "big")
 
 
+def _sample_mode() -> str:
+    """Mutation-sampling mode. Stratified (one candidate per line) by default;
+    override with ``MLPMT_SAMPLE_MODE=uniform`` in the environment."""
+    return os.environ.get("MLPMT_SAMPLE_MODE", "stratified_floor")
+
+
 def prepare_checkout(checkout: Path, project: str) -> None:
     """Apply any test-infra patches needed to run the suite on this pytest."""
     if project == "thefuck":
@@ -284,10 +290,13 @@ def version_pairs(
     original = path.read_text()
     # Fault-agnostic sampling: a seed fixed per (version, file) keeps the
     # retained mutant set deterministic and independent of fault locations.
+    # Stratified mode spreads the budget one-candidate-per-line, giving
+    # deterministic coverage of all lines the budget reaches.
     mutants = generate_mutants(
         original,
         limit=max_mutants,
         seed=_stable_seed(version_name, relative_file),
+        mode=_sample_mode(),
     )
 
     baseline_results = run_pytest(checkout, tests, python)

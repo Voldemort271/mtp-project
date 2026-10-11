@@ -18,7 +18,11 @@ from execution.pytest_runner import coverage_by_test_file, run_pytest
 from ml_pmt import OutcomeChangeModel, predict_and_rank
 from ml_pmt.ranker import line_aggregates
 from scripts.build_bugs import BUGS, BUGS_ROOT, WORK, make_sandbox, select_tests
-from scripts.evaluate_localization import honest_two_stage_ranking, rank_metrics
+from scripts.evaluate_localization import (
+    apply_full_universe_floor,
+    honest_two_stage_ranking,
+    rank_metrics,
+)
 from scripts.build_bugs import BUGS, WORK
 from scripts.evaluate_localization import rank_metrics
 
@@ -269,6 +273,7 @@ def main() -> int:
             checkout, python, tests, fault_files, packages, baseline
         ).items():
             if method.startswith("_"):
+                spectrum = ranking
                 continue
             rankings[f"SBFL-{method}"] = ranking
         rankings["Hybrid (SBFL+pred)"] = hybrid_ranking(
@@ -282,6 +287,18 @@ def main() -> int:
             baseline=baseline,
             random_state=args.seed,
         )
+        # B1a: full-universe rankings (every covered line rankable via the
+        # Ochiai floor appended to the mutant-line ranking).
+        if "spectrum" in locals():
+            rankings["ML-PMT full-univ (pred)"] = apply_full_universe_floor(
+                rankings["ML-PMT (predicted)"], spectrum
+            )
+            rankings["ML-PMT full-univ (2stg)"] = apply_full_universe_floor(
+                rankings["ML-PMT (two-stage)"], spectrum
+            )
+        else:
+            rankings["ML-PMT full-univ (pred)"] = rankings["ML-PMT (predicted)"]
+            rankings["ML-PMT full-univ (2stg)"] = rankings["ML-PMT (two-stage)"]
 
         for method, ranking in rankings.items():
             metrics = rank_metrics(ranking, fault_lines)
@@ -290,6 +307,7 @@ def main() -> int:
                     "method": method,
                     "source_version": variant_id,
                     "num_ranked": len(ranking),
+                    "expressible": _is_expressible(variant, fault_lines),
                 }
             )
             _attach_cost(metrics, method, variant_id, pairs, run_times)
@@ -319,12 +337,53 @@ def main() -> int:
         time_s=("time_s", "mean"),
     ).reindex(
         ["Hybrid (SBFL+pred)", "ML-PMT (predicted)", "ML-PMT (two-stage)",
+         "ML-PMT full-univ (pred)", "ML-PMT full-univ (2stg)",
          "MBFL-real (Metallaxis)", "SBFL-ochiai", "SBFL-tarantula"]
     ).round(3)
     print(agg.to_string())
+    print()
+    n_total = len(results["source_version"].unique())
+    n_expr = len(results[results["expressible"]]["source_version"].unique())
+    print(f"=== B1b: aggregate on EXPRESSIBLE bugs only "
+          f"({n_expr}/{n_total} bugs with a flipping mutant) ===")
+    expr_results = results[results["expressible"]]
+    if not expr_results.empty:
+        agg_expr = expr_results.groupby("method").agg(
+            top1=("top1", "mean"),
+            top5=("top5", "mean"),
+            top10=("top10", "mean"),
+            mrr=("mrr", "mean"),
+            rank=("rank", "mean"),
+            exam=("exam", "mean"),
+        ).reindex(
+            ["Hybrid (SBFL+pred)", "ML-PMT (predicted)", "ML-PMT (two-stage)",
+             "ML-PMT full-univ (pred)", "ML-PMT full-univ (2stg)",
+             "MBFL-real (Metallaxis)", "SBFL-ochiai", "SBFL-tarantula"]
+        ).round(3)
+        print(agg_expr.to_string())
+    else:
+        print("(no expressible bugs)")
     print("\n=== Inference cost (test-suite executions per bug) ===")
     _print_cost(pairs)
     return 0
+
+
+def _is_expressible(variant: pd.DataFrame, fault_lines: list[int]) -> bool:
+    """B1b: is a bug's fault line expressible by the mutation engine?
+
+    A bug is expressible if at least one fault line has a mutant whose executed
+    outcome change (outcome_changed=1) lands on a *failing* baseline test —
+    i.e. the mutation framework has any signal to localize this bug.
+    """
+    if not fault_lines:
+        return False
+    failing = set(variant[variant["baseline_test_result"] == "fail"]["test_id"])
+    flipped_lines = set(
+        variant[
+            (variant["outcome_changed"] == 1) & (variant["test_id"].isin(failing))
+        ]["line_number"].astype(int)
+    )
+    return any(line in flipped_lines for line in fault_lines)
 
 
 def _attach_cost(
