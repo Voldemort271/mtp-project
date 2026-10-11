@@ -25,6 +25,9 @@ def predict_and_rank(
     if missing:
         raise ValueError(f"Missing candidate columns: {', '.join(sorted(missing))}")
 
-    predictions = candidate_pairs.loc[:, ["line_number", "test_id"]].copy()
+    if "file" in candidate_pairs.columns:
+        predictions = candidate_pairs.loc[:, ["file", "line_number", "test_id"]].copy()
+    else:
+        predictions = candidate_pairs.loc[:, ["line_number", "test_id"]].copy()
     predictions["probability"] = model.predict_probabilities(candidate_pairs)
     return rank_suspicious_lines(predictions, baseline_test_results)

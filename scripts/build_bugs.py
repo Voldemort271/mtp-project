@@ -391,7 +391,8 @@ def _version_task(spec: dict, tests: list[str], is_fixed: bool, task_index: int)
         ceiling_hits += version_ceiling
         if not is_fixed:
             fault_rows.extend(
-                {"source_version": version_name, "fault_line": line}
+                {"source_version": version_name,
+                 "file": relative_file, "fault_line": line}
                 for line in lines
             )
     return rows, fault_rows, flaky, ceiling_hits

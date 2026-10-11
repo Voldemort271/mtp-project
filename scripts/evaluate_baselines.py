@@ -63,27 +63,40 @@ def metallaxis_ranking(pairs: pd.DataFrame, variant_id: str) -> pd.DataFrame:
     passing = {test_id for test_id, result in baseline.items() if result == "pass"}
     total_failing = len(failing)
 
+    has_file = "file" in variant.columns
+    group_cols = (["file"] if has_file else []) + ["line_number", "test_id"]
     changed = (
-        variant.groupby(["line_number", "test_id"], as_index=False)["outcome_changed"]
-        .max()
+        variant.groupby(group_cols, as_index=False)["outcome_changed"].max()
     )
     rows = []
-    for line, group in changed.groupby("line_number"):
+    for key, group in changed.groupby(
+        (["file", "line_number"] if has_file else ["line_number"])
+    ):
+        if has_file:
+            file, line = key
+        else:
+            line = key[0] if isinstance(key, tuple) else key
+            file = None
         changed_tests = set(group[group["outcome_changed"] == 1]["test_id"])
         f_killed = len(changed_tests & failing)
         p_killed = len(changed_tests & passing)
         denominator = np.sqrt(total_failing * (f_killed + p_killed))
         score = f_killed / denominator if denominator > 0 else 0.0
-        rows.append(
-            {
-                "line_number": int(line),
-                "f_killed": float(f_killed),
-                "p_killed": float(p_killed),
-                "suspiciousness": float(score),
-            }
-        )
+        row = {
+            "line_number": int(line),
+            "f_killed": float(f_killed),
+            "p_killed": float(p_killed),
+            "suspiciousness": float(score),
+        }
+        if has_file:
+            row["file"] = file
+        rows.append(row)
+    sort_cols = (["file"] if has_file else []) + [
+        "suspiciousness", "f_killed", "p_killed", "line_number"
+    ]
+    ascending = ([True] if has_file else []) + [False, False, True, True]
     return pd.DataFrame(rows).sort_values(
-        ["suspiciousness", "line_number"], ascending=[False, True], ignore_index=True
+        sort_cols, ascending=ascending, ignore_index=True
     )
 
 
@@ -139,10 +152,10 @@ def sbfl_ranking(
     for method, column in (("ochiai", "ochiai"), ("tarantula", "tarantula")):
         if frame.empty:
             rankings[method] = pd.DataFrame(
-                columns=["line_number", "suspiciousness"]
+                columns=["file", "line_number", "suspiciousness"]
             )
             continue
-        ranking = frame.loc[:, ["line_number", column]].rename(
+        ranking = frame.loc[:, ["file", "line_number", column]].rename(
             columns={column: "suspiciousness"}
         )
         rankings[method] = ranking.sort_values(
@@ -249,9 +262,13 @@ def main() -> int:
     run_times = _project_run_times(pairs)
 
     records = []
+    coverage_cache = _coverage_cache(pairs)
     for variant_id, group in faults.groupby("source_version"):
         variant_id = str(variant_id)
-        fault_lines = sorted(int(line) for line in group["fault_line"])
+        fault_lines = sorted(
+            (str(f), int(l))
+            for f, l in zip(group["file"], group["fault_line"])
+        )
         variant = pairs[pairs["source_version"] == variant_id]
         baseline = dict(
             zip(variant["test_id"], variant["baseline_test_result"], strict=True)
@@ -266,6 +283,16 @@ def main() -> int:
             ),
             "MBFL-real (Metallaxis)": metallaxis_ranking(pairs, variant_id),
         }
+        # Learned full-universe two-stage (B1a): the RF is trained on non-mutant
+        # rows too, using the coverage cache, so it learns to rank them directly.
+        if variant_id in coverage_cache:
+            rankings["ML-PMT full-univ (2stg-learned)"] = honest_two_stage_ranking(
+                pairs,
+                faults,
+                variant_id,
+                args.seed,
+                coverage_cache=coverage_cache,
+            )
         project = variant_id.split("-")[0]
         bug = variant_id.split("-")[1]
         checkout, python, packages = variant_environment(variant_id)
@@ -338,6 +365,7 @@ def main() -> int:
     ).reindex(
         ["Hybrid (SBFL+pred)", "ML-PMT (predicted)", "ML-PMT (two-stage)",
          "ML-PMT full-univ (pred)", "ML-PMT full-univ (2stg)",
+         "ML-PMT full-univ (2stg-learned)",
          "MBFL-real (Metallaxis)", "SBFL-ochiai", "SBFL-tarantula"]
     ).round(3)
     print(agg.to_string())
@@ -358,6 +386,7 @@ def main() -> int:
         ).reindex(
             ["Hybrid (SBFL+pred)", "ML-PMT (predicted)", "ML-PMT (two-stage)",
              "ML-PMT full-univ (pred)", "ML-PMT full-univ (2stg)",
+             "ML-PMT full-univ (2stg-learned)",
              "MBFL-real (Metallaxis)", "SBFL-ochiai", "SBFL-tarantula"]
         ).round(3)
         print(agg_expr.to_string())
@@ -368,7 +397,42 @@ def main() -> int:
     return 0
 
 
-def _is_expressible(variant: pd.DataFrame, fault_lines: list[int]) -> bool:
+def _coverage_cache(pairs: pd.DataFrame) -> dict[str, dict[int, dict]]:
+    """Build ``{source_version: {line: {a,b,ochiai,tarantula,dstar}}}`` for every
+    buggy (non-fixed) variant, by running SBFL coverage once per bug. Used to
+    train the learned full-universe two-stage (B1a)."""
+    cache: dict[str, dict[int, dict]] = {}
+    buggy = [v for v in pairs["source_version"].unique() if not str(v).endswith("-fixed")]
+    for variant_id in buggy:
+        variant = pairs[pairs["source_version"] == variant_id]
+        baseline = dict(zip(variant["test_id"], variant["baseline_test_result"], strict=True))
+        tests = sorted(set(variant["test_id"]))
+        fault_files = sorted(set(variant["file"]))
+        checkout, python, packages = variant_environment(variant_id)
+        spectrum = sbfl_ranking(checkout, python, tests, fault_files, packages, baseline)["_spectrum"]
+        entry: dict[int, dict] = {}
+        for _, row in spectrum.iterrows():
+            line = int(row["line_number"])
+            a, b = int(row["a"]), int(row["b"])
+            entry[line] = {
+                "a": a,
+                "b": b,
+                "ochiai": float(row["ochiai"]),
+                "tarantula": float(row["tarantula"]),
+                "dstar": _dstar(a, b, 0),
+            }
+        cache[variant_id] = entry
+    return cache
+
+
+def _dstar(a: int, b: int, c: int) -> float:
+    denominator = b + c
+    return float((a * a) / denominator) if denominator > 0 else float(a) if a else 0.0
+
+
+def _is_expressible(
+    variant: pd.DataFrame, fault_lines: list[tuple]
+) -> bool:
     """B1b: is a bug's fault line expressible by the mutation engine?
 
     A bug is expressible if at least one fault line has a mutant whose executed
@@ -378,12 +442,16 @@ def _is_expressible(variant: pd.DataFrame, fault_lines: list[int]) -> bool:
     if not fault_lines:
         return False
     failing = set(variant[variant["baseline_test_result"] == "fail"]["test_id"])
-    flipped_lines = set(
-        variant[
-            (variant["outcome_changed"] == 1) & (variant["test_id"].isin(failing))
-        ]["line_number"].astype(int)
-    )
-    return any(line in flipped_lines for line in fault_lines)
+    flipped = variant[
+        (variant["outcome_changed"] == 1) & (variant["test_id"].isin(failing))
+    ]
+    for fpath, line in fault_lines:
+        if (
+            (flipped["file"].astype(str) == fpath)
+            & (flipped["line_number"].astype(int) == int(line))
+        ).any():
+            return True
+    return False
 
 
 def _attach_cost(

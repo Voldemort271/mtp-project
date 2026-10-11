@@ -40,12 +40,17 @@ def line_aggregates(
     *,
     collapse: str = "max",
 ) -> pd.DataFrame:
-    """Collapse per-test pair probabilities into one row per line."""
-    frame = pairs_for_bug.loc[:, ["line_number", "test_id", "test_covers_mutation"]].copy()
+    """Collapse per-test pair probabilities into one row per (file, line)."""
+    has_file = "file" in pairs_for_bug.columns
+    cols = (["file"] if has_file else []) + [
+        "line_number", "test_id", "test_covers_mutation"
+    ]
+    frame = pairs_for_bug.loc[:, cols].copy()
     frame["probability"] = probabilities
     frame["is_failing"] = pairs_for_bug["baseline_test_result"] == "fail"
 
-    collapsed = frame.groupby(["line_number", "test_id"]).agg(
+    group_cols = (["file"] if has_file else []) + ["line_number", "test_id"]
+    collapsed = frame.groupby(group_cols).agg(
         probability=("probability", "max" if collapse == "max" else "mean"),
         covers=("test_covers_mutation", "max"),
     ).reset_index()
@@ -53,7 +58,13 @@ def line_aggregates(
     collapsed["is_failing"] = collapsed["test_id"].isin(failing_test_ids)
 
     rows = []
-    for line, group in collapsed.groupby("line_number"):
+    for key, group in collapsed.groupby(
+        (["file", "line_number"] if has_file else ["line_number"])
+    ):
+        if has_file:
+            file, line = key
+        else:
+            line = key[0] if isinstance(key, tuple) else key
         failing = group[group["is_failing"]]
         passing = group[~group["is_failing"]]
         a = int((failing["covers"] == 1).sum())
@@ -62,30 +73,31 @@ def line_aggregates(
         n_passing = int(len(passing))
         c = n_failing - a
         e = n_passing - b
-        rows.append(
-            {
-                "line_number": int(line),
-                "f_killed": float(failing["probability"].sum()),
-                "p_killed": float(passing["probability"].sum()),
-                "n_mutants": int(pairs_for_bug[pairs_for_bug["line_number"] == line].shape[0]),
-                "n_failing_cover": a,
-                "n_passing_cover": b,
-                "max_failing_prob": float(
-                    failing["probability"].max() if len(failing) else 0.0
-                ),
-                "mean_failing_prob": float(
-                    failing["probability"].mean() if len(failing) else 0.0
-                ),
-                "frac_failing_high": float(
-                    (failing["probability"] > 0.5).mean() if len(failing) else 0.0
-                ),
-                "n_failing": n_failing,
-                "n_passing": n_passing,
-                "ochiai": _ochiai(a, b, c),
-                "tarantula": _tarantula(a, b, c, e),
-                "dstar": _dstar(a, b, c),
-            }
-        )
+        row = {
+            "line_number": int(line),
+            "f_killed": float(failing["probability"].sum()),
+            "p_killed": float(passing["probability"].sum()),
+            "n_mutants": int(pairs_for_bug[pairs_for_bug["line_number"] == line].shape[0]),
+            "n_failing_cover": a,
+            "n_passing_cover": b,
+            "max_failing_prob": float(
+                failing["probability"].max() if len(failing) else 0.0
+            ),
+            "mean_failing_prob": float(
+                failing["probability"].mean() if len(failing) else 0.0
+            ),
+            "frac_failing_high": float(
+                (failing["probability"] > 0.5).mean() if len(failing) else 0.0
+            ),
+            "n_failing": n_failing,
+            "n_passing": n_passing,
+            "ochiai": _ochiai(a, b, c),
+            "tarantula": _tarantula(a, b, c, e),
+            "dstar": _dstar(a, b, c),
+        }
+        if has_file:
+            row["file"] = file
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -241,7 +253,10 @@ class TwoStageRanker:
             features.loc[mutant_mask, "suspiciousness"] = (
                 proba[:, 1] if proba.shape[1] > 1 else proba[:, 0]
             )
-        return features.loc[:, ["line_number", "suspiciousness"]].sort_values(
+        out_cols = ["file", "line_number", "suspiciousness"] if "file" in features.columns else [
+            "line_number", "suspiciousness"
+        ]
+        return features.loc[:, out_cols].sort_values(
             ["suspiciousness", "line_number"],
             ascending=[False, True],
             ignore_index=True,

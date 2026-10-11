@@ -49,10 +49,14 @@ def rank_suspicious_lines(
         raise ValueError("At least one baseline test must fail to localize a fault")
 
     predictions = pair_predictions.loc[:, ["line_number", "test_id", "probability"]].copy()
+    has_file = "file" in pair_predictions.columns
+    if has_file:
+        predictions["file"] = pair_predictions["file"].astype(str)
     if predictions.empty:
-        return pd.DataFrame(
-            columns=["line_number", "f_killed", "p_killed", "suspiciousness"]
-        )
+        cols = (["file"] if has_file else []) + [
+            "line_number", "f_killed", "p_killed", "suspiciousness"
+        ]
+        return pd.DataFrame(columns=cols)
     predictions["test_id"] = predictions["test_id"].astype(str)
     unknown_tests = set(predictions["test_id"]).difference(baseline)
     if unknown_tests:
@@ -72,12 +76,18 @@ def rank_suspicious_lines(
         raise ValueError("probability values must be between 0 and 1")
     predictions["probability"] = probabilities
 
-    # Version 1: one test contributes at most once to a source line.
-    collapsed = predictions.groupby(["line_number", "test_id"], as_index=False)[
-        "probability"
-    ].max()
-    rows: list[dict[str, float | int]] = []
-    for line_number, line_predictions in collapsed.groupby("line_number"):
+    # Version 1: one test contributes at most once to a source (file, line).
+    group_cols = (["file"] if has_file else []) + ["line_number", "test_id"]
+    collapsed = predictions.groupby(group_cols, as_index=False)["probability"].max()
+    rows: list[dict[str, float | int | str]] = []
+    for key, line_predictions in collapsed.groupby(
+        (["file", "line_number"] if has_file else ["line_number"])
+    ):
+        if has_file:
+            file, line_number = key
+        else:
+            line_number = key[0] if isinstance(key, tuple) else key
+            file = None
         probabilities_by_test = line_predictions.set_index("test_id")["probability"]
         failing_mass = sum(
             float(probabilities_by_test.get(test_id, 0.0))
@@ -91,19 +101,23 @@ def rank_suspicious_lines(
         )
         denominator = np.sqrt(failing_count * (failing_mass + passing_mass))
         score = failing_mass / denominator if denominator > 0 else 0.0
-        rows.append(
-            {
-                "line_number": int(line_number),
-                "f_killed": failing_mass,
-                "p_killed": passing_mass,
-                "suspiciousness": float(score),
-            }
-        )
+        row: dict[str, float | int | str] = {
+            "line_number": int(line_number),
+            "f_killed": failing_mass,
+            "p_killed": passing_mass,
+            "suspiciousness": float(score),
+        }
+        if has_file:
+            row["file"] = file
+        rows.append(row)
 
+    sort_cols = (["file"] if has_file else []) + [
+        "suspiciousness", "f_killed", "p_killed", "line_number"
+    ]
+    asc = [True] if has_file else []
+    asc += [False, False, True, True]
     ranked = pd.DataFrame(rows).sort_values(
-        ["suspiciousness", "line_number"],
-        ascending=[False, True],
-        ignore_index=True,
+        sort_cols, ascending=asc, ignore_index=True
     )
     if universe:
         # B1a fallback: merge in non-mutant covered lines. Kept consistent with

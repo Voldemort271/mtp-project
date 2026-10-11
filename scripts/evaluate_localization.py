@@ -13,7 +13,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from ml_pmt import OutcomeChangeModel, predict_and_rank
-from ml_pmt.ranker import LINE_FEATURE_COLUMNS, TwoStageRanker, line_aggregates
+from ml_pmt.ranker import (
+    LINE_FEATURE_COLUMNS,
+    TwoStageRanker,
+    extend_to_full_universe,
+    line_aggregates,
+)
 from sklearn.ensemble import RandomForestClassifier
 
 
@@ -38,40 +43,73 @@ def apply_full_universe_floor(
     if spectrum is None or spectrum.empty:
         return ranking
     spec = spectrum.loc[:, ["line_number", "ochiai"]].copy()
+    if "file" in spectrum.columns and "file" in ranking.columns:
+        spec["file"] = spectrum["file"].astype(str)
 
     def _norm(s: pd.Series) -> pd.Series:
         spread = s.max() - s.min()
         return (s - s.min()) / spread if spread > 0 else s * 0.0
 
     mut = ranking.loc[:, ["line_number", "suspiciousness"]].copy()
+    if "file" in ranking.columns:
+        mut["file"] = ranking["file"].astype(str)
     mut["suspiciousness"] = _norm(mut["suspiciousness"].astype(float))
     spec["ochiai"] = _norm(spec["ochiai"].astype(float))
 
     merged = spec.rename(columns={"ochiai": "ochiai_n"})
-    merged = merged.merge(
-        mut, on="line_number", how="outer"
-    )
+    if "file" in spec.columns and "file" in mut.columns:
+        merged = merged.merge(mut, on=["file", "line_number"], how="outer")
+    else:
+        merged = merged.merge(mut, on="line_number", how="outer")
     merged["suspiciousness"] = merged[
         ["ochiai_n", "suspiciousness"]
     ].max(axis=1)
-    return merged.loc[:, ["line_number", "suspiciousness"]].sort_values(
+    out_cols = (
+        ["file", "line_number", "suspiciousness"]
+        if "file" in merged.columns
+        else ["line_number", "suspiciousness"]
+    )
+    return merged.loc[:, out_cols].sort_values(
         ["suspiciousness", "line_number"],
         ascending=[False, True],
         ignore_index=True,
     )
 
 
-def rank_metrics(ranking: pd.DataFrame, fault_lines: list[int]) -> dict:
-    """Compute ranking metrics for known fault lines (best rank wins)."""
-    lines = ranking["line_number"].tolist()
-    ranks = [lines.index(line) + 1 for line in fault_lines if line in lines]
+def rank_metrics(
+    ranking: pd.DataFrame,
+    faults: list[tuple],
+) -> dict:
+    """Compute ranking metrics for known faults.
+
+    ``faults`` is a list of ``(file, line)`` (or ``(line,)`` for legacy
+    line-only callers). If the ranking carries a ``file`` column, faults are
+    matched by ``(file, line)``; otherwise by line number only. Best rank wins.
+    """
+    if "file" in ranking.columns:
+        entries = list(
+            zip(ranking["file"].astype(str),
+                ranking["line_number"].astype(int))
+        )
+        fault_pairs = []
+        if all(isinstance(f, (tuple, list)) and len(f) == 2 for f in faults):
+            fault_pairs = [(str(f[0]), int(f[1])) for f in faults]
+        else:
+            # legacy line-only faults -> match against the first file
+            first_file = str(ranking["file"].iloc[0])
+            fault_pairs = [(first_file, int(f)) for f in faults]
+        ranks = [entries.index(fp) + 1 for fp in fault_pairs if fp in entries]
+    else:
+        lines = ranking["line_number"].tolist()
+        fault_lines = [f[1] if isinstance(f, (tuple, list)) else f for f in faults]
+        ranks = [lines.index(line) + 1 for line in fault_lines if line in lines]
     if ranks:
         rank = min(ranks)
     else:
-        rank = len(lines) + 1
-    exam = rank / max(len(lines), 1)
+        rank = len(ranking) + 1
+    exam = rank / max(len(ranking), 1)
     return {
-        "fault_lines": fault_lines,
+        "fault_lines": [list(f) if not isinstance(f, int) else f for f in faults],
         "rank": rank,
         "top1": rank == 1,
         "top5": rank <= 5,
@@ -124,11 +162,20 @@ def honest_two_stage_ranking(
     faults: pd.DataFrame,
     variant_id: str,
     random_state: int,
+    *,
+    coverage_cache: dict[str, dict[int, dict]] | None = None,
 ) -> pd.DataFrame:
     """Two-stage ranking with honest leave-one-bug-out line-rank training.
 
     Each training bug's line features come from a pair model that has NOT seen
     that bug (nested), so the ranker never trains on in-sample pair predictions.
+
+    When ``coverage_cache`` is provided (maps source_version -> {line: {a,b,
+    ochiai,tarantula,dstar}} for the full covered universe), both the training
+    rows and the held-out lines are extended to the **full covered universe**:
+    non-mutant lines get zero mutation signal plus their SBFL coverage features
+    and the ``is_fault`` label, so the learned ranker is trained on them rather
+    than only flooring them at inference (B1a, learned variant).
     """
     bug_key = variant_id.removesuffix("-fixed")
 
@@ -143,18 +190,25 @@ def honest_two_stage_ranking(
             )
         return OutcomeChangeModel(random_state=random_state).fit(subset)
 
+    def _build_features(source_version: str, model: OutcomeChangeModel) -> pd.DataFrame:
+        sp = pairs[pairs["source_version"] == source_version]
+        feats = line_aggregates(sp, model.predict_probabilities(sp))
+        if coverage_cache:
+            feats = extend_to_full_universe(
+                feats, coverage_cache.get(source_version, {})
+            )
+        return feats
+
     holdout_model = train_without(bug_key)
-    held = pairs[pairs["source_version"] == variant_id]
-    held_features = line_aggregates(held, holdout_model.predict_probabilities(held))
+    held_features = _build_features(variant_id, holdout_model)
 
     training_rows = []
     for other in pairs["source_version"].unique():
         other_key = str(other).removesuffix("-fixed")
         if other_key == bug_key:
             continue
-        other_pairs = pairs[pairs["source_version"] == other]
         model = train_without(bug_key, other_key)
-        features = line_aggregates(other_pairs, model.predict_probabilities(other_pairs))
+        features = _build_features(str(other), model)
         fault_lines = set(
             faults[faults["source_version"] == other]["fault_line"].astype(int)
         )
@@ -170,7 +224,12 @@ def honest_two_stage_ranking(
     held_features["suspiciousness"] = (
         proba[:, 1] if proba.shape[1] > 1 else proba[:, 0]
     )
-    return held_features.loc[:, ["line_number", "suspiciousness"]].sort_values(
+    out_cols = (
+        ["file", "line_number", "suspiciousness"]
+        if "file" in held_features.columns
+        else ["line_number", "suspiciousness"]
+    )
+    return held_features.loc[:, out_cols].sort_values(
         ["suspiciousness", "line_number"], ascending=[False, True], ignore_index=True
     )
 
