@@ -182,14 +182,18 @@ def select_tests(
         raise RuntimeError(f"Test collection failed for {checkout}")
     targets = target_tests((bug_dir / "run_test.sh").read_text(), test_modules[0])
 
+    # Keep the FULL set of actually-failing tests, not just the run_test.sh
+    # targets. select_tests previously discarded most real failures, forcing
+    # F=1 for many bugs, which collapses the Metallaxis f_killed to {0,1} and
+    # made fault lines look mutation-inexpressible. Allowing F to reflect the
+    # bug's true failing suite gives mutation-based FL a real kill signal.
     failing = [
         test_id
-        for target in targets
         for test_id, result in results.items()
-        if result == "fail" and matches(test_id, target)
+        if result == "fail"
     ]
     if not failing:
-        raise RuntimeError(f"No target test fails on {checkout}")
+        raise RuntimeError(f"No failing test on {checkout}")
     passing = [tid for tid, result in results.items() if result == "pass"][:6]
     return failing + passing, failing
 
