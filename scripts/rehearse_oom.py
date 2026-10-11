@@ -11,8 +11,11 @@ import sys
 import threading
 import time
 import subprocess
+from pathlib import Path
 
-sys.path.insert(0, "/home/shubi/work/code/mtp")
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 peak = {"sys_mb": 0.0, "single_mb": 0.0}
 stop = threading.Event()

@@ -20,24 +20,49 @@ if str(ROOT) not in sys.path:
 
 BUGSINPY_URL = "https://github.com/soarsmu/BugsInPy.git"
 
-# Per-project test environment: Python version and required test deps.
+# Per-project test environment: Python version and required test deps, pinned
+# to versions verified to work for the current corpus (deterministic
+# reproduction across systems).
 PROJECTS = {
     "tqdm": {
         "python": "3.11",
-        "deps": ["pytest", "pytest-cov", "coverage", "numpy", "nose"],
+        "deps": [
+            "pytest==9.1.1",
+            "pytest-cov==7.1.0",
+            "coverage==7.16.2",
+            "numpy==2.4.6",
+            "nose==1.3.7",
+        ],
     },
     "thefuck": {
         "python": "3.11",
         "deps": [
-            "pytest", "pytest-cov", "coverage", "mock", "pytest-mock",
-            "colorama", "decorator", "psutil", "pyte", "six", "wcwidth",
+            "pytest==9.1.1",
+            "pytest-cov==7.1.0",
+            "coverage==7.16.2",
+            "mock==5.2.0",
+            "pytest-mock==3.16.0",
+            "colorama==0.4.6",
+            "decorator==5.3.1",
+            "psutil==7.2.2",
+            "pyte==0.8.2",
+            "six==1.17.0",
+            "wcwidth==0.9.1",
         ],
     },
     "black": {
         "python": "3.11",
         "deps": [
-            "pytest", "pytest-cov", "coverage", "click", "appdirs",
-            "pathspec", "toml", "regex", "attrs", "typed-ast",
+            "pytest==9.1.1",
+            "pytest-cov==7.1.0",
+            "coverage==7.16.2",
+            "click==8.5.0",
+            "appdirs==1.4.4",
+            "pathspec==1.1.1",
+            "toml==0.10.2",
+            "regex==2026.9.29",
+            "attrs==26.1.0",
+            "typed-ast==1.5.5",
         ],
     },
 }
