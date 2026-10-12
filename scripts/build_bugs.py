@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -350,6 +351,11 @@ def version_pairs(
         seed=_stable_seed(version_name, relative_file),
         mode=_sample_mode(),
     )
+    print(
+        f"  [{version_name}::{relative_file}] {len(mutants)} mutants | "
+        f"{len(tests)} tests | cap {max_mutants}",
+        flush=True,
+    )
 
     baseline_results = run_pytest(checkout, tests, python)
     if "_suite_error" in baseline_results:
@@ -379,6 +385,12 @@ def version_pairs(
         flaky_cells += sum(
             1 for test_id in tests if test_id not in mutant_results
         )
+        if (index + 1) % 25 == 0 or index + 1 == len(mutants):
+            print(
+                f"  [{version_name}::{relative_file}] {index + 1}/{len(mutants)} "
+                f"mutants | rows so far {len(rows)} | flaky {flaky_cells}",
+                flush=True,
+            )
         metadata = node_metadata(
             original,
             mutant["line"],
@@ -489,19 +501,33 @@ def build_corpus(
 
         with ProcessPoolExecutor(max_workers=workers) as executor:
             futures = [executor.submit(_version_task, *task) for task in tasks]
-            for future in futures:
+            t_start = time.monotonic()
+            for done, future in enumerate(futures, 1):
                 version_rows, version_faults, flaky, ceiling = future.result()
                 rows.extend(version_rows)
                 fault_rows.extend(version_faults)
                 total_flaky += flaky
                 total_ceiling += ceiling
+                print(
+                    f"[corpus] {done}/{len(tasks)} tasks done | "
+                    f"rows so far {len(rows)} | "
+                    f"{time.monotonic() - t_start:.0f}s elapsed",
+                    flush=True,
+                )
     else:
-        for task in tasks:
+        t_start = time.monotonic()
+        for done, task in enumerate(tasks, 1):
             version_rows, version_faults, flaky, ceiling = _version_task(*task)
             rows.extend(version_rows)
             fault_rows.extend(version_faults)
             total_flaky += flaky
             total_ceiling += ceiling
+            print(
+                f"[corpus] {done}/{len(tasks)} tasks done | "
+                f"rows so far {len(rows)} | "
+                f"{time.monotonic() - t_start:.0f}s elapsed",
+                flush=True,
+            )
 
     if total_flaky:
         print(f"Dropped {total_flaky} flaky (mutant, test) cells.")
